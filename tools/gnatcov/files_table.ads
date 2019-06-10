@@ -17,7 +17,6 @@
 ------------------------------------------------------------------------------
 
 with Ada.Containers.Vectors;
-with Ada.Streams;  use Ada.Streams;
 with Ada.Text_IO;  use Ada.Text_IO;
 
 with GNAT.Strings; use GNAT.Strings;
@@ -118,9 +117,14 @@ package Files_Table is
    --
    --  This is used make sure all accesses to a file expect a consistent kind.
 
-   function Get_Full_Name (Index : Source_File_Index) return String;
+   function Get_Full_Name
+     (Index : Source_File_Index; Or_Simple : Boolean := False) return String;
+   --  Return the full name for the given index. If there is no full name and
+   --  Or_Simple is true, return the simple name instead. Otherwise, abort with
+   --  an error message.
+
    function Get_Simple_Name (Index : Source_File_Index) return String;
-   --  Return the full/simple name for the given index
+   --  Return the simple name for the given index
 
    function Get_Unique_Name (Index : Source_File_Index) return String
       with Pre => Get_File (Index).Kind = Source_File;
@@ -128,7 +132,7 @@ package Files_Table is
    --  full name that is unique to this file (multiple files can have the same
    --  base name). This is availble only for source files. Since unicity
    --  changes when new files are registered in the table, it is invalid to
-   --  register file once Get_Unique_Name has been invoked once.
+   --  register a new file once Get_Unique_Name has been invoked once.
 
    --  Utilities to open files from the source file table. Source files will be
    --  searched on the local filesystem, in the following order:
@@ -349,6 +353,9 @@ package Files_Table is
 
    procedure Files_Table_Iterate
      (Process : not null access procedure (Index : Source_File_Index));
+   --  Call Process for all file info entries in the files table, in sorted
+   --  simple names order. Note that it is invalid to register a new file past
+   --  the first files table iteration.
 
    function First_File return Source_File_Index;
    --  Return the first valid source file index
@@ -434,12 +441,10 @@ package Files_Table is
    -- Checkpoints --
    -----------------
 
-   procedure Checkpoint_Save (S : access Root_Stream_Type'Class);
+   procedure Checkpoint_Save (CSS : access Checkpoint_Save_State);
    --  Save the current files table to S
 
-   procedure Checkpoint_Load
-     (S  : access Root_Stream_Type'Class;
-      CS : access Checkpoint_State);
+   procedure Checkpoint_Load (CLS : access Checkpoint_Load_State);
    --  Load checkpointed files table from S and merge in current state
 
 private

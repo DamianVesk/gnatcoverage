@@ -20,6 +20,9 @@
 
 with GNAT.Strings; use GNAT.Strings;
 
+with GNATCOLL.Projects;
+with GNATCOLL.VFS;
+
 with Inputs;
 
 package Project is
@@ -47,6 +50,10 @@ package Project is
    function Is_Project_Loaded return Boolean;
    --  Return whether Load_Root_Project was called and returned successfully
 
+   function Root_Project_Filename return String
+      with Pre => Is_Project_Loaded;
+   --  Return the file name for the loaded root project
+
    function Get_Single_Main_Executable return String;
    --  If there is only one main source in the loaded project, return the full
    --  path of its main executable (including its suffix, for instance ".exe").
@@ -61,11 +68,13 @@ package Project is
    --  If the loaded root project has an Origin_Project attribute, return its
    --  value. Return an empty string otherwise.
 
-   procedure Compute_Project_View;
-   --  Recompute the view of the loaded project within the current scenario
-
    procedure Set_Subdirs (Subdir : String);
    --  Set the object subdir for all loaded projects
+
+   procedure Enable_Externally_Built_Projects_Processing
+      with Pre => not Is_Project_Loaded;
+   --  Request that the projects marked as externally built are included in
+   --  processings (they are excluded by default).
 
    --------------------------------------
    -- Accessors for project properties --
@@ -79,6 +88,30 @@ package Project is
    --  present, it overrides the set of units to be considered, else the set
    --  defined by the project through the Units, Units_List, Exclude_Units, and
    --  Exclude_Units_List attributes is used.
+
+   procedure Enumerate_Ada_Sources
+     (Callback       : access procedure
+        (Project : GNATCOLL.Projects.Project_Type;
+         File    : GNATCOLL.Projects.File_Info);
+      Override_Units : Inputs.Inputs_Type);
+   --  Call Callback once for every Ada source file mentionned in a previous
+   --  Add_Project call. Override_Units has the same semantics as in
+   --  Enumerate_LIs.
+
+   type Main_Source_File is record
+      File    : GNATCOLL.VFS.Virtual_File;
+      --  Base name for the source file
+
+      Project : GNATCOLL.Projects.Project_Type;
+      --  The project this source files comes from
+   end record;
+
+   type Main_Source_File_Array is
+      array (Positive range <>) of Main_Source_File;
+
+   function Enumerate_Ada_Mains return Main_Source_File_Array;
+   --  Return the list of all Ada main source files recursively found in the
+   --  loaded project tree.
 
    function Find_Source_File (Simple_Name : String) return String_Access;
    --  Look for the absolute path for the source file called Simple_Name. If no
@@ -109,5 +142,12 @@ package Project is
    procedure Enumerate_Ignored_Source_Files
      (Process : access procedure (Source_File : String));
    --  Call Process on each name in the Coverage'Ignored_Source_File attribute
+
+   ---------------------------------------
+   -- Raw accessor for the project tree --
+   ---------------------------------------
+
+   function Project return GNATCOLL.Projects.Project_Tree_Access
+      with Pre => Is_Project_Loaded;
 
 end Project;

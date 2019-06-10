@@ -2,7 +2,7 @@
 --                                                                          --
 --                               GNATcoverage                               --
 --                                                                          --
---                     Copyright (C) 2009-2016, AdaCore                     --
+--                     Copyright (C) 2009-2019, AdaCore                     --
 --                                                                          --
 -- GNATcoverage is free software; you can redistribute it and/or modify it  --
 -- under terms of the GNU General Public License as published by the  Free  --
@@ -19,32 +19,65 @@
 --  Source Coverage Obligations
 
 with Ada.Containers.Ordered_Maps;
-with Ada.Streams; use Ada.Streams;
-
+with Ada.Containers.Vectors;
 with GNAT.Regexp;
 
+with Namet;
+with Snames; use Snames;
+with Types;  use Types;
+
 limited with Checkpoints;
-with Slocs;       use Slocs;
-with Traces;      use Traces;
-with Types;       use Types;
-with Snames;      use Snames;
+with Instrument; use Instrument;
+with Slocs;      use Slocs;
+with Traces;     use Traces;
 
 package SC_Obligations is
+
+   --  This unit instantiates containers and we want to avoid too much
+   --  performance cost when using references to their elements, so suppress
+   --  tampering checks.
+
+   pragma Suppress (Tampering_Check);
+
+   ------------------
+   -- Source files --
+   ------------------
+
+   package SFI_Vectors is new Ada.Containers.Vectors
+     (Index_Type   => Pos,
+      Element_Type => Source_File_Index);
+   --  Vector of source file indices, used to map dependency indices in an
+   --  ALI file to our source file indices.
+
+   subtype SFI_Vector is SFI_Vectors.Vector;
 
    -----------------------
    -- Compilation units --
    -----------------------
 
+   type SCO_Provider is (Compiler, Instrumenter);
+
    type CU_Id is new Natural;
    No_CU_Id : constant CU_Id := 0;
    subtype Valid_CU_Id is CU_Id range No_CU_Id + 1 .. CU_Id'Last;
+
+   function Allocate_CU
+     (Provider : SCO_Provider;
+      Origin   : Source_File_Index := No_Source_File) return CU_Id;
+   --  Allocate a new element in the compilation units table, optionally
+   --  setting the CU's origin information.
+
+   function Provider (CU : CU_Id) return SCO_Provider;
+   --  Return the SCO provider corresponding to the given compilation unit
 
    function Comp_Unit (Src_File : Source_File_Index) return CU_Id;
    --  Return the identifier for the compilation unit containing the given
    --  source, or No_CU_Id if no such LI file has been loaded.
 
    procedure Set_Unit_Has_Code (CU : CU_Id);
-   --  Record the presence of object code for CU
+   --  Record the presence of object code for CU. For units analyzed through
+   --  source instrumentation, this is detected by the presence of coverage
+   --  buffers for the unit.
 
    procedure Report_Units_Without_Code;
    --  Emit an error message for any unit of interest for which no object code
@@ -92,6 +125,20 @@ package SC_Obligations is
    --  Return True if there is at least one Statement or Condition SCO whose
    --  range has a non-null intersection with Sloc_Begin .. Sloc_End.
 
+   type LL_HL_SCO_Map is array (Nat range <>) of SCO_Id;
+   --  Map of low level SCOs to high level SCOs
+
+   procedure Process_Low_Level_SCOs
+     (CU_Index     : CU_Id;
+      Main_Source  : Source_File_Index;
+      Deps         : SFI_Vector := SFI_Vectors.Empty_Vector;
+      SCO_Map      : access LL_HL_SCO_Map := null);
+   --  Populate high level SCO tables from low level ones, which have been
+   --  populated either from an LI file, or directly by the instrumenter.
+   --  Low-level SCOs come from global tables in package SCOs. Bit maps are
+   --  provided in the case of source instrumentation. If SCO_Map is provided,
+   --  it is set with the mapping of low level SCOs to high level SCOs.
+
    procedure Load_SCOs
      (ALI_Filename         : String;
       Ignored_Source_Files : access GNAT.Regexp.Regexp);
@@ -104,6 +151,9 @@ package SC_Obligations is
 
    procedure Report_Multipath_Decisions;
    --  Output a list of decisions containing multiple paths
+
+   procedure Dump_All_SCOs;
+   --  Output all SCOs
 
    procedure Iterate (P : access procedure (SCO : SCO_Id));
    --  Execute P for each SCO
@@ -129,6 +179,8 @@ package SC_Obligations is
    No_Condition_Index : constant Any_Condition_Index := -1;
    subtype Condition_Index is
      Any_Condition_Index range 0 .. Any_Condition_Index'Last;
+
+   type Condition_Values_Array is array (Condition_Index range <>) of Tristate;
 
    type Operand_Position is (Left, Right);
 
@@ -233,7 +285,8 @@ package SC_Obligations is
 
    function Outcome (SCO : SCO_Id; Value : Boolean) return Tristate;
    --  Outcome of decision if this condition has the given value, or Unknown
-   --  if the value does not determine the decision outcome.
+   --  if the value does not determine the decision outcome. (Follows through
+   --  constant conditions).
 
    function Value (SCO : SCO_Id) return Tristate;
    --  Value of the condition (True or False) if compile-time known. Unknown
@@ -243,13 +296,16 @@ package SC_Obligations is
    --  Enclosing decision (climbing up the expression tree through operator
    --  SCOs).
 
+   function Offset_For_True (SCO : SCO_Id) return Natural;
+   --  Offset to be added to BDD path index when this condition is True
+
    procedure Get_Origin
      (SCO        : SCO_Id;
       Prev_SCO   : out SCO_Id;
       Prev_Value : out Boolean);
-   --  For a condition SCO that is part of a decision with no diamond, return
-   --  the previous tested condition and the value of that condition causing
-   --  the condition denoted by SCO to be evaluated.
+   --  For a condition SCO that is part of a decision with no multipath,
+   --  condition, return the previous tested condition and the value of
+   --  that condition causing the condition denoted by SCO to be evaluated.
 
    --  Operator SCOs
 
@@ -266,9 +322,8 @@ package SC_Obligations is
    --  For a decision whose outcome is compile time known, return that outcome;
    --  otherwise return Unknown.
 
-   function Has_Diamond (SCO : SCO_Id) return Boolean;
-   --  True if decison's BDD has a diamond, i.e. a node reachable through more
-   --  than one path.
+   function Has_Multipath_Condition (SCO : SCO_Id) return Boolean;
+   --  True if decison's BDD has a node reachable through more than one path
 
    function Enclosing_Statement (SCO : SCO_Id) return SCO_Id;
    --  Enclosing statement (climbing up the tree through any enclosing
@@ -283,7 +338,20 @@ package SC_Obligations is
    --  True if SCO is for a pragma Assert/Pre/Postcondition/Check, or an
    --  equivalent aspect.
 
+   function Path_Count (SCO : SCO_Id) return Natural;
+   --  Return count of paths through decision's BDD from root condition to
+   --  any outcome.
+
+   function Condition_Values
+     (SCO        : SCO_Id;
+      Path_Index : Natural;
+      Outcome    : out Boolean) return Condition_Values_Array;
+   --  Return the vector of condition values and outcome for the BDD path
+   --  with the given index.
+
    procedure Set_Degraded_Origins (SCO : SCO_Id; Val : Boolean := True);
+   --  Flag SCO to indicate that the value of its (only) condition is known
+   --  only modulo an arbitrary negation.
 
    --------------------------
    -- Sloc -> SCO_Id index --
@@ -298,19 +366,71 @@ package SC_Obligations is
    type Sloc_To_SCO_Map_Array_Acc is access all Sloc_To_SCO_Map_Array;
    --  Maps for statement, decision, condition, and operator SCOs
 
+   ---------------------------
+   -- Source trace bit maps --
+   ---------------------------
+
+   --  For units whose SCOs come from source instrumentation, maintain
+   --  mapping of coverage buffer bit indices to SCO info.
+
+   type Statement_Bit_Map is array (Bit_Id range <>) of SCO_Id;
+   type Statement_Bit_Map_Access is access all Statement_Bit_Map;
+   --  Statement buffer: bit set True denotes that the statement was executed
+
+   type Decision_Bit_Info is record
+      D_SCO   : SCO_Id;
+      --  Decision SCO
+
+      Outcome : Boolean;
+      --  Decision outcome
+   end record;
+
+   type Decision_Bit_Map is array (Bit_Id range <>) of Decision_Bit_Info;
+   type Decision_Bit_Map_Access is access all Decision_Bit_Map;
+   --  Decision buffer: bit set True denotes that the given decision was
+   --  evaluated to the given outcome.
+
+   type MCDC_Bit_Info is record
+      D_SCO      : SCO_Id;
+      --  Decision SCO
+
+      Path_Index : Natural;
+      --  BDD path index
+   end record;
+
+   type MCDC_Bit_Map is array (Bit_Id range <>) of MCDC_Bit_Info;
+   type MCDC_Bit_Map_Access is access all MCDC_Bit_Map;
+   --  MCDC buffer: bit set True denotes that the given decision was
+   --  evaluated, and that the indicated path through the BDD was taken.
+
+   type CU_Bit_Maps is record
+      Statement_Bits : Statement_Bit_Map_Access;
+      Decision_Bits  : Decision_Bit_Map_Access;
+      MCDC_Bits      : MCDC_Bit_Map_Access;
+   end record;
+
+   function Bit_Maps (CU : CU_Id) return CU_Bit_Maps;
+   --  For a unit whose coverage is assessed through source code
+   --  instrumentation, return bit maps.
+
+   procedure Set_Bit_Maps (CU : CU_Id; Bit_Maps : CU_Bit_Maps);
+   --  Set the tables mapping source trace bit indices to SCO discharge info
+
    -----------------
    -- Checkpoints --
    -----------------
 
-   procedure Checkpoint_Save (S : access Root_Stream_Type'Class);
-   --  Save the current SCOs to S
+   procedure Checkpoint_Save (CSS : access Checkpoints.Checkpoint_Save_State);
+   --  Save the current SCOs to stream
 
-   procedure Checkpoint_Load
-     (S  : access Root_Stream_Type'Class;
-      CS : access Checkpoints.Checkpoint_State);
-   --  Load checkpointed SCOs from S and merge them in current state
+   procedure Checkpoint_Load (CLS : access Checkpoints.Checkpoint_Load_State);
+   --  Load checkpointed SCOs from stream and merge them in current state
 
-private
+   function Case_Insensitive_Get_Pragma_Id
+     (Pragma_Name : Namet.Name_Id) return Pragma_Id;
+   --  Return the Pragma_Id correspnding to the given pragma name. This takes
+   --  care of converting Pragma_Name to lowercase (canonical form for
+   --  Snames.Get_Pragma_Id)
 
    --  For each pragma we know of, whether an occurrence of the pragma in the
    --  source might generate code of its own, e.g. pragma Precondition.
@@ -483,9 +603,11 @@ private
           Pragma_Machine_Attribute => False,
           Pragma_Main => False,
           Pragma_Main_Storage => False,
+          Pragma_Max_Entry_Queue_Depth => False,
           Pragma_Max_Queue_Length => False,
           Pragma_Memory_Size => False,
           Pragma_No_Body => False,
+          Pragma_No_Caching => False,
           Pragma_No_Elaboration_Code_All => False,
           Pragma_No_Inline => False,
           Pragma_No_Return => False,
@@ -556,6 +678,16 @@ private
           Pragma_Storage_Size => False,
           Pragma_Storage_Unit => False,
 
+          --  OpenACC support: as of today, GNATcoverage is not ready to assess
+          --  the coverage of code that is offloaded to external devices. This
+          --  means we support only compiling with OpenACC pragmas disabled, so
+          --  we can safely assume they don't generate code.
+
+          Pragma_Acc_Data => False,
+          Pragma_Acc_Kernels => False,
+          Pragma_Acc_Loop => False,
+          Pragma_Acc_Parallel => False,
+
           --  Now pragmas which might generate code. This is an explicit list
           --  instead of a mere "others" fallback to make sure we notice when
           --  new pragmas get in the daily compiler from which we build, which
@@ -588,5 +720,18 @@ private
           Pragma_Type_Invariant_Class => True,
 
           Unknown_Pragma => True);
+
+private
+
+   --  Write accessors for child units
+
+   procedure Set_Operand
+     (Operator : SCO_Id;
+      Position : Operand_Position;
+      Operand  : SCO_Id);
+   --  Set the operand slot indicated by Position in Operator to Operand
+
+   procedure Set_BDD_Node (C_SCO : SCO_Id; BDD_Node : BDD_Node_Id);
+   --  Set the BDD node for the given condition SCO
 
 end SC_Obligations;

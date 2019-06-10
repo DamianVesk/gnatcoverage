@@ -1160,12 +1160,17 @@ Using project files (:option:`-P`, :option:`--projects`, :option:`--units`)
 ---------------------------------------------------------------------------
 
 As an alternative to manually providing the complete list of Library
-Information files to consider, you can use GNAT project files to specify units
-of interest directly. As an application often incurs a tree of (sub-)projects,
-the units of interest designation incurs two levels of selection: first,
-specify the set of :dfn:`projects of interest` where the units of interest
-reside, then for each project of interest, specify units of interest therein
-if needed.
+Information files to consider with :option:`--scos`, you can use GNAT project
+files to specify units of interest directly. When both :option:`--scos` and
+project file options are on the command line, :option:`--scos` prevails and
+the project files are just ignored with respect to the units of interest
+computation.
+
+As an application often incurs a tree of (sub-)projects, the units of interest
+designation with project files incurs two levels of selection: first, specify
+the set of :dfn:`projects of interest` where the units of interest reside,
+then for each project of interest, specify units of interest therein if
+needed.
 
 For starters, a single :dfn:`root project` must be specified using the
 :option:`-P` option, then projects of interest within the tree rooted at the
@@ -1560,6 +1565,28 @@ this would be::
 On the other hand, if two distinct instances of a generic subprogram are
 inlined within a single calling routine, they will undergo a single coverage
 analysis since they now occur in the same symbol.
+
+Handling Ada assertions and contracts
+=====================================
+
+Ada 2012 introduced sophisticated *programming by contract* mechanisms which
+generalize the base ``pragma Assert`` construct originally offered by the
+language. All these facilities allow asserting various properties of the
+program state at specific points of its execution, for example as type
+invariants or as Pre/Post-conditions on subprograms.
+
+Each property is expressed a Boolean expression expected to hold True,
+triggering an exception otherwise. When the current assertion policy activates
+a given assertion construct, the associated Boolean expression is treated by
+|gcv| as a decision for MCDC purposes.
+
+As assertions are by construction designed never to evaluate False, reaching
+proper coverage for them is non-trivial, if not entirely meaningless, for
+post-conditions in particular.
+
+The simple way out consists in disabling the relevant constructs in builds
+intended for coverage analysis, by setting the corresponding
+``Assertion_Policy`` to ``Disable`` with GNAT Pro toolchains.
 
 .. _c_macros:
 

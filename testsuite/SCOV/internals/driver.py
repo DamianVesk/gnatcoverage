@@ -21,16 +21,21 @@ __all__ = ["SCOV_helper"]
 
 # ****************************************************************************
 
+from collections import defaultdict
 import os
 
-from SCOV.tctl import CAT
+from SCOV.tctl import CAT, CovControl
+
+from SCOV.instr import xcov_instrument
 
 from SUITE.context import thistest
 from SUITE.control import language_info
 from SUITE.cutils import to_list, list_to_file, match, contents_of, no_ext
-from SUITE.tutils import gprbuild, gprfor, xrun, xcov, frame
+from SUITE.gprutils import GPRswitches
+from SUITE.tutils import gprbuild, gprfor, cmdrun, xrun, xcov, frame
 from SUITE.tutils import gprbuild_cargs_with
-from SUITE.tutils import exename_for, tracename_for, ckptname_for
+from SUITE.tutils import exename_for
+from SUITE.tutils import srctracename_for, tracename_for, ckptname_for
 
 from gnatpython.fileutils import cd, mkdir, ls
 
@@ -133,18 +138,6 @@ class WdirControl:
 # ======================================
 # == SCOV_helper and internal helpers ==
 # ======================================
-
-# Dictionary of lists with default on read:
-
-class ListDict(dict):
-    def __init__(self):
-        dict.__init__(self)
-
-    def __getitem__(self, key):
-        if not dict.has_key(self, key):
-            dict.__setitem__(self, key, [])
-        return dict.__getitem__(self, key)
-
 
 # Relevant expectations and emitted Line and Report notes for each test
 # CATEGORY:
@@ -328,11 +321,11 @@ class _Xchecker:
 
         xnotes = self.xdict[xkind]
 
-        self.sat = ListDict()
+        self.sat = defaultdict(lambda: [])
         [self.try_sat_over(ekind, xn)
          for xn in xnotes for ekind in ekinds if not xn.discharger]
 
-        self.unsat = ListDict()
+        self.unsat = defaultdict(lambda: [])
         [self.register_unsat(xn) for xn in xnotes if not xn.discharger]
 
         [self.process_unsat(block) for block in self.unsat]
@@ -392,6 +385,38 @@ class _Xchecker:
 class SCOV_helper:
     """Helper class for source coverage activities."""
 
+    # The differences between the different kinds of traces (binary or source)
+    # are handled by specializing a few operations.
+
+    def mode_build(self):
+        """For a single test (not consolidation), build the program to run
+        out of the test sources.
+        """
+        raise NotImplementedError
+
+    def mode_execute(self, main):
+        """Execute the program designated by MAIN, arranging to produce an
+        execution trace. Return the name of a file containing the execution
+        output.
+        """
+        raise NotImplementedError
+
+    def mode_coverage_sco_options(self):
+        """Return the gnatcov options to use to convey how SCOs should
+        be retrieved at gnatcov coverage analysis time.
+        """
+        raise NotImplementedError
+
+    def mode_gprdeps(self):
+        """Return a list of mode specific project file dependencies that should
+        be added to a single test project file, as needed at build or execution
+        time.
+        """
+        raise NotImplementedError
+
+    def mode_tracename_for(self, pgm):
+        raise NotImplementedError
+
     # --------------
     # -- __init__ --
     # --------------
@@ -430,9 +455,14 @@ class SCOV_helper:
         # Compute the gnatcov coverage specific extra options that we'll have
         # to pass. We need these early for Xnote expansions.
 
-        self.covoptions = [
-            '--level='+self.xcovlevel
-            ] + (to_list (self.covctl.covoptions) if self.covctl else [])
+        self.covoptions = ['--level='+self.xcovlevel]
+        if self.covctl:
+            self.covoptions += to_list(self.covctl.covoptions)
+
+        # Compute the list of test launch options strings that we need for
+        # expectation CTL lines.
+
+        ctl_opts = ['--trace-mode=%s' % thistest.options.trace_mode]
 
         self.extracargs = to_list (self.testcase.extracargs)
 
@@ -450,6 +480,7 @@ class SCOV_helper:
 
         xnotes = XnotesExpander (
             xfile=xfile, xcov_level=xcovlevel,
+            ctl_opts  = ctl_opts,
             ctl_cov   = self.covoptions,
             ctl_cargs = gprbuild_cargs_with (thiscargs=self.extracargs),
             ctl_tags  = thistest.options.tags,
@@ -469,6 +500,25 @@ class SCOV_helper:
             not self.xlnotes, "empty xlnotes from %s !!" % xfile)
         thistest.fail_if (
             not self.xrnotes, "empty xrnotes from %s !!" % xfile)
+
+    def sources_of_interest(self):
+        """List of sources for which we have expectations to match."""
+        return self.xrnotes.keys()
+
+    def units_of_interest(self):
+        """Set of units for which we have expectations to match, based
+        on the list of sources for which we have expectations and assuming
+        standard  use of '-' in filenames for child units or subunits
+        (foo-bar.ads for package Foo.Bar).
+        """
+        return {no_ext(os.path.basename(soi)).replace('-', '.')
+                for soi in self.sources_of_interest()}
+
+    def programs(self):
+        """List of base binary file names for the test drivers we are
+        given to exercise.
+        """
+        return [no_ext(main) for main in self.drivers]
 
     # --------------------------
     # -- xcov_translation_for --
@@ -495,57 +545,6 @@ class SCOV_helper:
         """Whether SELF instantiates a single test."""
         return len(self.drivers) == 1
 
-    # ----------------
-    # -- locate_ali --
-    # ----------------
-    def locate_ali(self,source):
-        """Return the fullpath of the ali file corresponding to the given
-        SOURCE file.  Return None if none was found.
-        """
-
-        # Whatever the kind of test we are (single or consolidation), we
-        # expect every ALI file of interest to be associated with at least
-        # one single test, and to be present in the "obj" subdirectory of
-        # the associated binary dir.
-
-        # Compute the local path from single test bindir and iterate over
-        # binary dir for all our drivers until we find. There might actually
-        # be several instances in the consolidation case. We assume they are
-        # all identical, and they should be for typical situations where the
-        # same sources were exercised by multiple drivers:
-
-        lang_info = language_info(source)
-        lali="obj/"+lang_info.scofile_for(os.path.basename(source))
-        for main in self.drivers:
-            tloc=self.abdir_for(no_ext(main))+lali
-            if os.path.exists(tloc):
-                return tloc
-
-        return None
-
-    # --------------
-    # -- ali_list --
-    # --------------
-    def ali_list(self):
-        """Return a set of ali files corresponding to the list of sources
-        specified in this tests's UXset.
-        """
-
-        # It is legitimate for some sources to not have an associated ali, for
-        # example Ada separate sub-units compiled as part of their parent. We
-        # just skip those and will fail matching expectations if the SCOs are
-        # nowhere else.
-
-        # We might also have expectations for different sources that map to
-        # the same ali, as for example with the spec and body of the same
-        # package.  We make our result a set to prevent duplicates and xcov
-        # warnings later on.
-
-        return set (
-            [ali for ali in (self.locate_ali(source)
-                             for source in self.xrnotes) if ali]
-            )
-
     # ---------
     # -- run --
     # ---------
@@ -557,6 +556,22 @@ class SCOV_helper:
         # Whatever the kind of test, we get to a Working Directory and
         # switch back when done:
         self.to_workdir(self.rwdir())
+
+        # If we are requested to convey units of interest through a project
+        # file and don't have a coverage control object to obey, build one to
+        # convey the units of interest:
+
+        if thistest.options.gprmode and not self.covctl:
+            self.covctl = CovControl(units_in=self.units_of_interest())
+
+        # Assess whether we should be using a project file to convey units of
+        # interest, either requested from the command line or for specific
+        # test purposes:
+
+        self.gprmode = (
+            thistest.options.gprmode
+            or (self.covctl
+                and self.covctl.requires_gpr()))
 
         # Compute our GPR now, which we will need for build of single tests
         # and/or analysis later on if in gprmode.  Turn inlining off for the
@@ -576,46 +591,23 @@ class SCOV_helper:
             exedir = self.abdir(),
             main_cargs = "-fno-inline",
             langs = ["Ada", "C"],
-            deps = self.covctl.deps if self.covctl else (),
+            deps = self.mode_gprdeps() + \
+                    (self.covctl.deps if self.covctl else []),
             extra = self.covctl.gpr () if self.covctl else "")
 
-        # For single tests (no consolidation), we first need to build,
-        # producing the binary to execute and the ALIs files, then to gnatcov
-        # run to get an execution trace.  All these we already have for
+        # For single tests (no consolidation), we first need to build, then
+        # to execute to get an execution trace.  All these we already have for
         # consolidation tests, and there's actually no need to build if we
         # were provided a bin directory to reuse:
 
         if self.singletest() and not self.wdctl.reuse_bin:
-            gprbuild (self.gpr, extracargs=self.extracargs)
-
-        # Compute the gnatcov command line argument we'll pass to convey
-        # the set of scos to operate upon.  Note that we need these for
-        # both gnatcov run and gnatcov coverage.
-
-        thistest.gprmode = (
-            thistest.options.gprmode
-            or (self.covctl
-                and self.covctl.requires_gpr()))
-
-        self.scoptions = (
-            to_list (self.covctl.scoptions) if (
-                self.covctl and self.covctl.scoptions)
-            else ["-P%s" % self.gpr] if thistest.gprmode
-            else ["--scos=@%s" % list_to_file(self.ali_list(), "alis.list")]
-            )
-
-        # Remember which of these indicate the use of project files, which
-        # might influence default output dirs for example.
-
-        self.gproptions = [
-            opt for opt in self.scoptions if opt.startswith ("-P")
-            ]
+            self.mode_build ()
 
         # Do gnatcov run now unless we're consolidating.  We'll just reuse
         # traces from previous executions in the latter case.
 
         if self.singletest():
-            self.xcov_run(no_ext(self.drivers[0]))
+            self.run_test(main=no_ext(self.drivers[0]))
 
         # At this point, we have everything we need for the analysis. Either
         # from the just done build+run in the single test case, or from
@@ -701,33 +693,19 @@ class SCOV_helper:
         return self.adir_for (self.rbdir())
 
     # --------------
-    # -- xcov_run --
+    # -- run_test --
     # --------------
-    def xcov_run(self,main):
-        """run MAIN through "xcov run" to produce an execution trace."""
+    def run_test(self, main):
+        """Execute the MAIN program to produce an execution trace, and
+        trigger a failure if it raises an unhandled exception."""
 
-        # Feed xcov run with full path (absolute dir) of the program so we
-        # can directly get to the binary from the trace when reading it from
-        # a different directory, such as in consolidation tests.
-
-        ofile="xcov_run_%s.out" % main
-
-        # Some execution engines (e.g. valgrind) do not let us distinguish
-        # executed program errors from engine errors. Because of them, we
-        # ignore here any kind of execution error for tests expected to trigger
-        # failures (such as harness tests), assuming that they will perform
-        # further checks that are bound to fail if the execution doesn't
-        # proceed as expected somehow (e.g. not producing a trace).
-
-        xrun([self.abdir_for(main)+exename_for(main),
-              "--level=%s" % self.xcovlevel] + self.scoptions,
-             out=ofile, register_failure=not self.testcase.expect_failures)
+        out_file = self.mode_execute(main=main)
 
         thistest.fail_if (
             match (
                 "(!!! EXCEPTION RAISED !!!"
                 "|raised [A-Z_]+ : [-._a-zA-Z]+:[0-9]+ \w+)",
-                ofile),
+                out_file),
             "exception raised while running '%s'." % main)
 
     # -------------------------
@@ -751,7 +729,7 @@ class SCOV_helper:
             '--annotate='+format, inputs
             ] + (self.covoptions + to_list(options))
 
-        if self.gproptions:
+        if self.gprmode:
             covargs.append ('--output-dir=.')
 
         # Run, latching standard output in a file so we can check contents on
@@ -812,38 +790,42 @@ class SCOV_helper:
 
         (input_opt, input_fn) = \
             ("--checkpoint=", ckptname_for) if use_checkpoint_inputs \
-            else ("", tracename_for)
+            else ("", self.mode_tracename_for)
 
-        inputs = "%s@" % input_opt + list_to_file(
-            [self.awdir_for(no_ext(main))+input_fn(no_ext(main))
-             for main in self.drivers],
-            "inputs.list")
+        inputs = "%s@%s" % (
+            input_opt, list_to_file(
+                [self.awdir_for(pgm) + input_fn(pgm)
+                 for pgm in self.programs()],
+                "inputs.list"))
 
-        # We don't need and don't want to pass SCO options when using
-        # checkpoints as inputs:
+        # Determine what command line options we'll pass to designate units of
+        # interest and maybe produce a coverage checkpoint. We don't need and
+        # don't want to pass SCO options when using checkpoints as inputs.
 
-        report_options = self.scoptions if not use_checkpoint_inputs else []
+        sco_options = (
+            [] if use_checkpoint_inputs else self.mode_coverage_sco_options())
 
-        report_options.extend (['-o', 'test.rep'])
+        save_checkpoint_options = (
+            ["--save-checkpoint=%s" % ckptname_for(single_driver)]
+            if single_driver and checkpoints else [])
 
-        if single_driver and checkpoints:
-            report_options.append (
-                "--save-checkpoint=%s" % ckptname_for (single_driver))
+        # Now produce the --annotate=report format:
 
         self.gen_one_xcov_report(
-            inputs, format="report", options=report_options)
+            inputs, format="report",
+            options=sco_options + save_checkpoint_options + ['-o', 'test.rep'])
 
-        # Now produce an alternate .xcov output format, unless we are
-        # performing a qualification run, for which that format isn't
-        # appropriate.
+        # Then an alternate .xcov output format, unless we are performing a
+        # qualification run, for which that format isn't appropriate. No need
+        # to regenerate a coverage checkpoint there - it would convey the same
+        # as what the --annotate=report already produced if a checkpoint is
+        # needed.
 
         if thistest.options.qualif_level:
             return
 
-        xcov_options = self.scoptions if not use_checkpoint_inputs else []
-
         self.gen_one_xcov_report(
-            inputs, format="xcov", options=xcov_options)
+            inputs, format="xcov", options=sco_options)
 
     # ------------------------------
     # -- check_unexpected_reports --
@@ -1051,6 +1033,8 @@ class SCOV_helper:
         mkdir(wdir)
         cd(wdir)
 
+        thistest.log("Work directory: %s" % os.getcwd())
+
     # ----------------
     # -- to_homedir --
     # ----------------
@@ -1058,3 +1042,207 @@ class SCOV_helper:
         """Switch to this test's homedir."""
         cd(self.homedir)
 
+
+class SCOV_helper_bin_traces(SCOV_helper):
+    """SCOV_helper specialization for the binary execution trace based mode."""
+
+    # Outline of the binary trace based scheme:
+    #
+    # * Compilation of the sources produces SCOS in .ali files,
+    #
+    # * Execution of a program produces a binary trace file
+    #
+    # * Analysis by gnatcov coverage for a single program takes the trace and
+    #   a description of the units of interest by way of a designation of the
+    #   corresponding ALI files containing SCOs, with -P or --scos.
+    #
+    # * Consolidation is achieved by either
+    #
+    #   - Passing all the traces and the global SCOS of interest via -P
+    #     or --scos to gnatcov coverage, or
+    #
+    #   - Combining coverage checkpoints produced for each program right
+    #     after their execution to generate a trace.
+    #
+    # A key characteristic of this scheme is that units of interest are
+    # conveyed through ALI files at analysis time, either when consolidating
+    # from traces or when producing intermediate coverage checkpoints.
+
+    def mode_build(self):
+        gprbuild(self.gpr, extracargs=self.extracargs)
+
+    def mode_execute(self, main):
+
+        out_file = 'xrun_{}.out'.format(main)
+
+        # Feed xcov run with full path (absolute dir) of the program so we
+        # can directly get to the binary from the trace when reading it from
+        # a different directory, such as in consolidation tests.
+        main_path = self.abdir_for(main) + exename_for(main)
+
+        # Some execution engines (e.g. valgrind) do not let us distinguish
+        # executed program errors from engine errors. Because of them, we
+        # ignore here any kind of execution error for tests expected to trigger
+        # failures (such as harness tests), assuming that they will perform
+        # further checks that are bound to fail if the execution doesn't
+        # proceed as expected somehow (e.g. not producing a trace).
+        xrun([main_path, "--level=%s" % self.xcovlevel] +
+             self.mode_coverage_sco_options(),
+             out=out_file, register_failure=not self.testcase.expect_failures)
+
+        return out_file
+
+    def mode_coverage_sco_options(self):
+        # If we have a request for specific options, honor that.  Otherwise,
+        # if we are requested to convey unit of interest through project file
+        # attributes, use our build project file which has been amended for
+        # that. Otherwise, fallback to --scos with a list of ALIs we compute
+        # here:
+
+        if self.covctl and self.covctl.gprsw:
+            return self.covctl.gprsw.as_strings
+        elif self.gprmode:
+            return ["-P%s" % self.gpr]
+        else:
+            return ["--scos=@%s" % list_to_file(self.ali_list(), "alis.list")]
+
+    def mode_gprdeps(self):
+        return []
+
+    def mode_tracename_for(self, pgm):
+        return tracename_for(pgm)
+
+    def locate_ali(self,source):
+        """Return the fullpath of the ali file corresponding to the given
+        SOURCE file.  Return None if none was found.
+        """
+
+        # Whatever the kind of test we are (single or consolidation), we
+        # expect every ALI file of interest to be associated with at least
+        # one single test, and to be present in the "obj" subdirectory of
+        # the associated binary dir.
+
+        # Compute the local path from single test bindir and iterate over
+        # binary dir for all our drivers until we find. There might actually
+        # be several instances in the consolidation case. We assume they are
+        # all identical, and they should be for typical situations where the
+        # same sources were exercised by multiple drivers:
+
+        lang_info = language_info(source)
+        lali="obj/"+lang_info.scofile_for(os.path.basename(source))
+        for main in self.drivers:
+            tloc=self.abdir_for(no_ext(main))+lali
+            if os.path.exists(tloc):
+                return tloc
+
+        return None
+
+    def ali_list(self):
+        """Return a set of ali files corresponding to the list of sources
+        specified in this tests's UXset.
+        """
+
+        # It is legitimate for some sources to not have an associated ali, for
+        # example Ada separate sub-units compiled as part of their parent. We
+        # just skip those and will fail matching expectations if the SCOs are
+        # nowhere else.
+
+        # We might also have expectations for different sources that map to
+        # the same ali, as for example with the spec and body of the same
+        # package.  We make our result a set to prevent duplicates and xcov
+        # warnings later on.
+
+        return set (
+            [ali for ali in (self.locate_ali(source)
+                             for source in self.sources_of_interest()) if ali]
+            )
+
+
+class SCOV_helper_src_traces(SCOV_helper):
+    """SCOV_helper specialization for the source instrumentation mode."""
+
+    # Outline of the source instrumentation based scheme:
+    #
+    # * Instrumentation produces instrumented sources and a so called
+    #   "instrumentation checkpoint", holding SCOs and data required to
+    #   decode source traces later on, similar to executable files for
+    #   binary traces.
+    #
+    #   Units of interest must be conveyed at this stage, through project
+    #   file attributes, as they control which units are instrumented.
+    #
+    # * Execution of the instrumented code produces a so called "source
+    #   trace" file.
+    #
+    # * Analysis for a single program proceeds by providing gnatcov coverage
+    #   with the source trace file and the corresponding instrumentation
+    #   checkpoint.
+    #
+    # * Consolidation is achieved by either
+    #
+    #   - Providing the set or source traces and the corresponding checkpoints
+    #     to gnatcov coverage, or
+    #
+    #   - Combining coverage checkpoints produced for each program right
+    #     after their execution to generate a trace.
+    #
+    # The main differences with the binary trace based scheme are:
+    #
+    # * Units of interest are conveyed at instrumentation time (even prior
+    #   to build) for the instrumentation scheme vs at analysis time for the
+    #   binary trace case)
+    #
+    # * Instrumentation checkpoints must be provided to gnatcov coverage
+    #   together with the source traces. Unlike executables for binary traces,
+    #   instrumentation checkpoints are not necessarily visible at program
+    #   execution time so can't be recorded in the traces.
+
+    def mode_build(self):
+
+        # We first need to instrument, with proper selection of the units of
+        # interest. Expect we are to provide this through a project file as
+        # we have no LI file at hand:
+        assert self.gprmode
+
+        # If we have a request for specific options, honor that. Otherwise,
+        # use the already computed project file for this test:
+        if self.covctl and self.covctl.gprsw:
+            instrument_gprsw = self.covctl.gprsw
+        else:
+            instrument_gprsw = GPRswitches(root_project=self.gpr)
+
+        xcov_instrument(
+            covlevel=self.xcovlevel, checkpoint='instr.ckpt',
+            gprsw=instrument_gprsw)
+
+        # Now we can build, instructing gprbuild to fetch the instrumented
+        # sources in their dedicated subdir:
+        gprbuild(
+            self.gpr, extracargs=self.extracargs,
+            gargs='--src-subdirs=gnatcov-instr')
+
+    def mode_execute(self, main):
+        out_file = 'cmdrun_{}.out'.format(main)
+        main_path = self.abdir_for(main) + exename_for(main)
+        cmdrun([main_path], out=out_file,
+               register_failure=not self.testcase.expect_failures)
+        return out_file
+
+    def mode_coverage_sco_options(self):
+
+        # Units of interest are conveyed at instrumentation time
+        # and the corresponding SCOs are held by the instrumentation
+        # checkpoints.
+
+        instr_checkpoints_opt = "--checkpoint=@%s" % list_to_file(
+            [self.abdir_for(pgm) + "instr.ckpt"
+             for pgm in self.programs()],
+            "instr-checkpoints.list")
+
+        return [instr_checkpoints_opt]
+
+    def mode_tracename_for(self, pgm):
+        return srctracename_for(pgm)
+
+    def mode_gprdeps(self):
+        return ["gnatcov_rts_full.gpr"]

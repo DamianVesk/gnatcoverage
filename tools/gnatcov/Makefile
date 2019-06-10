@@ -78,6 +78,7 @@ BINUTILS_BUILD_DIR?=$(BINUTILS_SRC_DIR)
 ###################
 
 GPRBUILD=gprbuild
+GPRINSTALL=gprinstall
 
 # Binary program name
 PGMNAME=gnatcov
@@ -174,13 +175,13 @@ dynamorio_ADAPTER_INSTALL_VARS=\
 trace32_ADAPTER_INSTALL_VARS=PREFIX=$(PREFIX)
 nexus_ADAPTER_INSTALL_VARS=PREFIX=$(PREFIX)
 
-.PHONY: default all adapters bin $(PGMPATH)
+.PHONY: default all adapters bin $(PGMPATH) gnatcov_rts_full
 
-default: bin
+default: bin gnatcov_rts_full
 
 bin: $(PGMPATH)
 
-all: bin adapters
+all: bin adapters gnatcov_rts_full
 
 $(PGMPATH):
 # Unlike BINUTILS_BUILD_DIR for which we have a default fallback,
@@ -209,6 +210,12 @@ $(ADAPTER_TARGETS): adapter-%: bin
 	$(MAKE) -C trace_adapters/$* $($*_ADAPTER_BUILD_VARS)
 
 adapters: $(ADAPTER_TARGETS)
+
+gnatcov_rts_full:
+	for build in static relocatable static-pic; do \
+	$(GPRBUILD) -Pshare/gnatcov_rts_full -p -j$(PARALLEL_BUILD) \
+		-XLIBRARY_TYPE=$$build; \
+	done
 
 #######################
 # Internal facilities #
@@ -287,7 +294,8 @@ clean-adapters: $(CLEAN_ADAPTER_TARGETS)
 # Installation #
 ################
 
-.PHONY: install-bin install-examples install-doc install install-adapters
+.PHONY: install-bin install-examples install-doc install-gnatcov_rts \
+	install-gnatcov_rts_full install install-adapters
 
 install-bin:
 	$(MKDIR) $(PREFIX)/bin
@@ -299,12 +307,28 @@ install-examples:
 	$(CP) -r examples/* $(PREFIX)/share/examples/$(DIRNAME)
 
 install-doc.%:
-	   $(MKDIR) $(PREFIX)/share/doc/$(DIRNAME)/$*
-	   $(CP) -r doc/$*/* $(PREFIX)/share/doc/$(DIRNAME)/$*
+	$(MKDIR) $(PREFIX)/share/doc/$(DIRNAME)/$*
+	$(CP) -r doc/$*/* $(PREFIX)/share/doc/$(DIRNAME)/$*
 
 install-doc: $(foreach fmt, $(DOCFORMATS), install-doc.$(fmt))
 
-install-common: install-bin install-examples
+install-gnatcov_rts:
+	$(MKDIR) $(PREFIX)/share/$(DIRNAME)
+	$(CP) -r \
+	    share/gnatcov_rts.gpr \
+	    share/gnatcov_rts \
+	    $(PREFIX)/share/$(DIRNAME)
+
+install-gnatcov_rts_full:
+	for build in static relocatable static-pic; do \
+	$(GPRINSTALL) -Pshare/gnatcov_rts_full -p -f --prefix=$(PREFIX) \
+		--sources-subdir=include/gnatcov_rts_full \
+		--build-var=LIBRARY_TYPE \
+		--build-name=$$build -XLIBRARY_TYPE=$$build; \
+	done
+
+install-common: install-bin install-examples install-gnatcov_rts \
+	install-gnatcov_rts_full
 install-without-doc: install-common
 install-with-doc: install-common install-doc
 install: install-with-doc

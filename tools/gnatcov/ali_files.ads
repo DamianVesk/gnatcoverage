@@ -2,7 +2,7 @@
 --                                                                          --
 --                               GNATcoverage                               --
 --                                                                          --
---                     Copyright (C) 2009-2012, AdaCore                     --
+--                     Copyright (C) 2009-2019, AdaCore                     --
 --                                                                          --
 -- GNATcoverage is free software; you can redistribute it and/or modify it  --
 -- under terms of the GNU General Public License as published by the  Free  --
@@ -19,10 +19,8 @@
 --  ALI files reader
 
 with Ada.Containers.Ordered_Maps;
-with Ada.Containers.Vectors;
 with Ada.Streams; use Ada.Streams;
 
-private with GNAT.SHA1;
 with GNAT.Regexp;
 with GNAT.Strings; use GNAT.Strings;
 
@@ -32,15 +30,11 @@ with Types; use Types;
 
 package ALI_Files is
 
-   package SFI_Vectors is new Ada.Containers.Vectors
-     (Index_Type   => Pos,
-      Element_Type => Source_File_Index);
-   --  Vector of source file indices, used to map dependency indices in an
-   --  ALI file to our source file indices.
+   --  This unit instantiates containers and we want to avoid too much
+   --  performance cost when using references to their elements, so suppress
+   --  tampering checks.
 
-   subtype SFI_Vector is SFI_Vectors.Vector;
-
-   type SCOs_Hash is private;
+   pragma Suppress (Tampering_Check);
 
    function Load_ALI
      (ALI_Filename         : String;
@@ -48,7 +42,6 @@ package ALI_Files is
       Ignored_Source_Files : access GNAT.Regexp.Regexp;
       Units                : out SFI_Vector;
       Deps                 : out SFI_Vector;
-      Fingerprint          : out SCOs_Hash;
       With_SCOs            : Boolean) return Types.Source_File_Index;
    --  Load coverage related information (coverage exemptions and, if With_SCOs
    --  is True, source coverage obligations) from ALI_Filename. Returns the
@@ -60,9 +53,6 @@ package ALI_Files is
    --  SC_Obligations.Load_SCOs' documentation).
    --
    --  Deps are the dependencies of the compilation.
-   --
-   --  Fingerprint is a unique hash of SCO information in the ALI file, and is
-   --  undefined if With_SCOs is False.
 
    procedure Load_ALI (ALI_Filename : String);
    --  Load ALI information for Filename, without SCOs
@@ -77,7 +67,9 @@ package ALI_Files is
       --  On or Off
 
       Message : String_Access;
-      --  When Kind = Exempt_On, justification message for the exemption
+      --  When Kind = Exempt_On, justification message for the exemption.
+      --  This is null if no justification is given (i.e. this is never an
+      --  access to an empty string).
 
       Count   : Natural := 0;
       --  When Kind = Exempt_On, this counts the "hits" on this exemption:
@@ -96,9 +88,5 @@ package ALI_Files is
         Element_Type => ALI_Annotation);
 
    ALI_Annotations : ALI_Annotation_Maps.Map;
-
-private
-
-   type SCOs_Hash is new GNAT.SHA1.Binary_Message_Digest;
 
 end ALI_Files;

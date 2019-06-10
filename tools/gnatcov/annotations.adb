@@ -22,14 +22,13 @@ with Ada.Strings.Unbounded;
 
 with Interfaces;
 
-with ALI_Files;   use ALI_Files;
+with ALI_Files; use ALI_Files;
 with Coverage.Object;
 with Coverage.Source;
 with Coverage.Tags;
-with Outputs;     use Outputs;
-with Qemu_Traces; use Qemu_Traces;
-with Strings;     use Strings;
-with Switches;    use Switches;
+with Outputs;   use Outputs;
+with Strings;   use Strings;
+with Switches;  use Switches;
 with Traces_Disa;
 
 package body Annotations is
@@ -571,25 +570,12 @@ package body Annotations is
    -------------------------
 
    procedure Inc_Exemption_Count (Sloc : Source_Location) is
+      use ALI_Annotation_Maps;
 
-      procedure Inc_Count (K : Source_Location; E : in out ALI_Annotation);
-      --  Increment E.Count
-
-      ---------------
-      -- Inc_Count --
-      ---------------
-
-      procedure Inc_Count (K : Source_Location; E : in out ALI_Annotation) is
-         pragma Unreferenced (K);
-      begin
-         E.Count := E.Count + 1;
-      end Inc_Count;
-
-   --  Start of processing for Inc_Exemption_Count
-
+      Cur : constant Cursor := ALI_Annotations.Find (Sloc);
+      E   : ALI_Annotation renames ALI_Annotations.Reference (Cur);
    begin
-      ALI_Annotations.Update_Element
-        (ALI_Annotations.Find (Sloc), Inc_Count'Access);
+      E.Count := E.Count + 1;
    end Inc_Exemption_Count;
 
    ------------------------
@@ -619,23 +605,23 @@ package body Annotations is
    -- Original_Processing_Context --
    ---------------------------------
 
-   function Original_Processing_Context (TF : Trace_File_Type) return String is
+   function Original_Processing_Context (TF : Trace_File_Element) return String
+   is
       use Ada.Calendar.Formatting;
       use Ada.Strings.Unbounded;
-
-      Context_Info : constant String := Get_Info (TF, Coverage_Context);
    begin
-      if Context_Info /= "" then
+      if TF.Context = null then
+         return "";
+
+      else
          declare
             Orig_Context : constant Coverage.Context :=
-              Coverage.From_String (Context_Info);
+              Coverage.From_String (TF.Context.all);
          begin
             return To_String (Orig_Context.Command)
               & " @ " & Image (Orig_Context.Timestamp,
                                Include_Time_Fraction => True);
          end;
-      else
-         return "";
       end if;
    end Original_Processing_Context;
 

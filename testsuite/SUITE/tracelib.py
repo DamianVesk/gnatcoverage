@@ -78,11 +78,31 @@ class TraceOp(Enum):
     """
     Trace operation bitmasks. See Trace_Op_* in qemu_traces.ads.
     """
-    Block   = 0x10
-    Fault   = 0x20
-    Br0     = 0x01
-    Br1     = 0x02
+    Block = 0x10
+    Fault = 0x20
+    Br0 = 0x01
+    Br1 = 0x02
     Special = 0x80
+
+    # Helper for the format_flags method, below
+    flag_chars = [(Block,   'B'), (Fault, 'F'),
+                  (Br0,     'b'), (Br1,   'f'),
+                  (Special, 's')]
+
+    @classmethod
+    def format_flags(cls, flags):
+        """
+        Return a human-readable representation for the given TraceOp value.
+
+        This returns a compact representation: "-----" for no bit set, "B-bf-"
+        for the block, br0 and br1 bits set, etc. This compact representation
+        has always the same length, and is thus suitable for tabular printings.
+
+        :param int flags: Integer value for the TraceOp to decode. This is the
+            integer that is read directly from the trace file.
+        """
+        return ''.join(char if flags & v else '-'
+                       for v, char in cls.flag_images)
 
 
 class TraceSpecial(Enum):
@@ -101,6 +121,7 @@ TRACE_MAGIC = '#QEMU-Traces'
 Exepected value of the Magic header field. See Qemu_Trace_Magic in
 qemu_traces.ads.
 """
+
 
 def create_trace_header(kind, pc_size, big_endian, machine):
     """
@@ -121,6 +142,7 @@ def create_trace_header(kind, pc_size, big_endian, machine):
         machine >> 8,
         machine & 0xff
     )
+
 
 TraceHeaderStruct = Struct(
     '12s'  # Magic string
@@ -243,6 +265,41 @@ class TraceFile(object):
         fp.write(TraceHeaderStruct.pack(*self.second_header))
         for entry in self.entries:
             entry.write(fp)
+
+    def iter_entries(self, raw=False):
+        """
+        Yield all trace entries in this trace file.
+
+        Unless `raw` is true, this interprets special trace entries, such as
+        loadaddr (module loaded at PC). In this case, other trace entries are
+        returned (and potentially skipped) accordingly.
+        """
+        entries = iter(self.entries)
+        offset = 0
+
+        # If there is a kernel, skip all trace entries until we get a loadaddr
+        # special one.
+        if not raw and InfoKind.Kernel_File_Name in self.infos.infos:
+            while True:
+                loadaddr = next(entries)
+                if (
+                    loadaddr.is_special and
+                    loadaddr.size == TraceSpecial.Loadaddr
+                ):
+                    offset = loadaddr.pc
+                    break
+
+        # Now go through the remaining list of trace entries
+        for e in entries:
+            # TODO: handle special trace entries that can show up here
+            # (load_shared_object, ...)
+            assert not e.is_special
+
+            # Discard trace entries for code below the module of interest
+            if not raw and e.pc < offset:
+                continue
+
+            yield TraceEntry(e.bits, e.pc - offset, e.size, e.op, e.infos)
 
 
 class TraceInfo(object):

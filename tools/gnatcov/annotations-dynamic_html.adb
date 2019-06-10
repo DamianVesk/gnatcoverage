@@ -42,7 +42,7 @@ with Qemu_Traces;
 with Strings;
 with Switches;
 with Traces_Disa;
-with Traces_Files_List;
+with Traces_Files; use Traces_Files;
 
 --  This package generates a dynamic HTML report, i.e. an HTML document heavily
 --  relying on JavaScript for presenting advanced graphical components.
@@ -293,7 +293,6 @@ package body Annotations.Dynamic_Html is
 
       procedure Append_Traces_List is
          use Qemu_Traces;
-         use Traces_Files_List;
          use Traces_Files_Lists;
 
          procedure Process_Trace (Position : Cursor);
@@ -308,16 +307,31 @@ package body Annotations.Dynamic_Html is
             TF           : constant Trace_File_Element_Acc :=
               Element (Position);
             Orig_Context : constant String :=
-              Original_Processing_Context (TF.Trace);
+              Original_Processing_Context (TF.all);
 
             Trace : constant JSON_Value := Create_Object;
 
          begin
             Trace.Set_Field ("filename", TF.Filename.all);
-            Trace.Set_Field ("program", Get_Info (TF.Trace, Exec_File_Name));
-            Trace.Set_Field
-              ("date", Format_Date_Info (Get_Info (TF.Trace, Date_Time)));
-            Trace.Set_Field ("tag", Get_Info (TF.Trace, User_Data));
+            Trace.Set_Field ("kind", Image (TF.Kind));
+
+            case TF.Kind is
+               when Binary_Trace_File =>
+                  Trace.Set_Field
+                    ("program", Get_Info (TF.Trace, Exec_File_Name));
+                  Trace.Set_Field
+                    ("date",
+                     Format_Date_Info (Get_Info (TF.Trace, Date_Time)));
+                  Trace.Set_Field ("tag", Get_Info (TF.Trace, User_Data));
+
+               when Source_Trace_File =>
+                  --  TODO: enhance the DHTML viewer to handle source trace
+                  --  files
+
+                  Trace.Set_Field ("program", "");
+                  Trace.Set_Field ("date", "");
+                  Trace.Set_Field ("tag", "");
+            end case;
 
             --  For a trace that has been processed in an earlier run, provide
             --  information on original coverage assessment context.

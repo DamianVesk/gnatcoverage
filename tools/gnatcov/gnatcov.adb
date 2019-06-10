@@ -49,6 +49,8 @@ with Binary_Files;
 with Execs_Dbase;       use Execs_Dbase;
 with Files_Table;       use Files_Table;
 with Inputs;            use Inputs;
+with Instrument;
+with Instrument.Input_Traces;
 with Object_Locations;
 with Outputs;           use Outputs;
 with Perf_Counters;
@@ -106,9 +108,9 @@ procedure GNATcov is
    Keep_Edges           : Boolean := False;
    Pretty_Print         : Boolean := False;
    SO_Inputs            : SO_Set_Type;
+   Keep_Reading_Traces  : Boolean := False;
 
-   function Command_Name return String
-   is
+   function Command_Name return String is
      (Command_Line.Parser.Command_Name (Arg_Parser, Args.Command));
 
    procedure Fatal_Error_With_Usage (Msg : String);
@@ -186,6 +188,11 @@ procedure GNATcov is
    --  Otherwise, leave it unmodified.
    --
    --  In any case, the returned Target_Board may be null.
+
+   procedure Report_Bad_Trace (Trace_Filename : String; Result : Read_Result)
+      with Pre => not Result.Success;
+   --  Emit the error corresponding to Result with Outputs. If
+   --  Keep_Reading_Tracess is false, this is a fatal error.
 
    ----------------------------
    -- Fatal_Error_With_Usage --
@@ -407,6 +414,10 @@ procedure GNATcov is
          Set_Subdirs (+Args.String_Args (Opt_Subdirs).Value);
       end if;
 
+      if Args.Bool_Args (Opt_Externally_Built_Projects) then
+         Enable_Externally_Built_Projects_Processing;
+      end if;
+
       --  If the project file does not define a target, loading it needs the
       --  target information: load it here. Likewise for the runtime system.
 
@@ -426,7 +437,6 @@ procedure GNATcov is
       --  project subsystem and load the root project.
 
       Load_Root_Project (Root_Project.all, Target_Family, Runtime, CGPR_File);
-      Compute_Project_View;
 
       --  Get common and command-specific switches, decode them (if any) and
       --  store the result in Project_Args, then merge it into Args.
@@ -554,6 +564,7 @@ procedure GNATcov is
       Excluded_SCOs               := Args.Bool_Args (Opt_Excluded_SCOs);
       Keep_Edges                  := Args.Bool_Args (Opt_Keep_Edges);
       Pretty_Print                := Args.Bool_Args (Opt_Pretty_Print);
+      Keep_Reading_Traces         := Args.Bool_Args (Opt_Keep_Reading_Traces);
 
       Load_Target_Option (Default_Target => True);
       Copy_Arg (Opt_Runtime, Runtime);
@@ -809,7 +820,8 @@ procedure GNATcov is
             | Cmd_Dump_Trace
             | Cmd_Dump_Trace_Raw
             | Cmd_Dump_Trace_Base
-            | Cmd_Dump_Trace_Asm =>
+            | Cmd_Dump_Trace_Asm
+            | Cmd_Dump_Src_Trace =>
 
             --  For "coverage", require an annotation format unless we must
             --  save a checkpoint. In this case, we'll just skip report
@@ -879,50 +891,80 @@ procedure GNATcov is
             end loop;
 
          when Cmd_Run =>
-            --  If we don't yet have an executable specified, pick the first
-            --  EARG. Forward the remaining EARGS from Args to the Eargs local.
-            --  If we don't even have one argument, try to get a single main
-            --  executable from the project tree.
+
+            --  Sort out what to use as the executable name and what EARGS to
+            --  forward to our Eargs local, depending on whether we have an
+            --  executable argument on the command line, in the eargs or in a
+            --  project file.
 
             case Args.Remaining_Args.Length is
+
                when 0 =>
+
+                  --  We don't have an executable specified on the base
+                  --  command line (before eargs).
+                  --
+                  --  If the first EARG is an executable file, use it and
+                  --  forward the rest.
+                  --
+                  --  Otherwise, if we can get an executable from a project
+                  --  file, use that and forward all the EARGS.
+                  --
+                  --  Otherwise, complain about missing an executable to run.
+
                   declare
                      Eargs_Arg : String_Vectors.Vector
                      renames Args.String_List_Args (Opt_Eargs);
+
+                     Exe_From_Project : constant String :=
+                       (if Is_Project_Loaded
+                          then Get_Single_Main_Executable
+                          else "");
+
+                     C : String_Vectors.Cursor :=
+                       String_Vectors.First (Eargs_Arg);
+
+                     use String_Vectors;
+
+                     Earg0 : constant String :=
+                       (if Has_Element (C) then +Element (C) else "");
+
+                     Earg0_Executable : constant Boolean :=
+                       GNAT.OS_Lib.Is_Executable_File (Earg0);
                   begin
-                     if Eargs_Arg.Length = 0 then
-                        declare
-                           Main : constant String :=
-                             (if Is_Project_Loaded
-                              then Get_Single_Main_Executable
-                              else "");
-                        begin
-                           if not Is_Project_Loaded or else Main = "" then
-                              Report_Missing_Argument
-                                ("an executable to run (EXE)");
-                           end if;
 
-                           Inputs.Add_Input (Exe_Inputs, Main);
-                        end;
-
-                     else
-                        for Arg of Eargs_Arg loop
-                           if Inputs.Length (Exe_Inputs) = 0 then
-                              Inputs.Add_Input
-                                (Exe_Inputs, +Eargs_Arg.First_Element);
-                           else
-                              Eargs.Append (Arg);
-                           end if;
+                     if Earg0_Executable then
+                        Inputs.Add_Input (Exe_Inputs, Earg0);
+                        loop
+                           Next (C);
+                           exit when not Has_Element (C);
+                           Eargs.Append (Element (C));
                         end loop;
+
+                     elsif Exe_From_Project /= "" then
+                        Inputs.Add_Input (Exe_Inputs, Exe_From_Project);
+                        Eargs := Eargs_Arg;
+                     else
+                        Report_Missing_Argument ("an executable to run (EXE)");
                      end if;
+
                   end;
 
                when 1 =>
+
+                  --  We have single executable argument on the base command
+                  --  line (before eargs). Use it and forward all the EARGS
+                  --  options we have to the Eargs local.
+
                   Inputs.Add_Input
                     (Exe_Inputs, +Args.Remaining_Args.First_Element);
                   Eargs := Args.String_List_Args (Opt_Eargs);
 
                when others =>
+
+                  --  We have more than one non-earg trailing argument on the
+                  --  base command line, complain.
+
                   Fatal_Error ("Only one EXEC parameter is allowed");
             end case;
 
@@ -937,6 +979,20 @@ procedure GNATcov is
                  (Option_Name (Arg_Parser, (String_List_Opt, Opt_Exec))
                   & " is missing (required for ""convert"")");
             end if;
+
+         when Cmd_Instrument =>
+
+            --  Ensure we have a source coverage level
+
+            if not Source_Coverage_Enabled then
+               Report_Missing_Argument ("a source coverage level");
+            end if;
+
+            if Args.Remaining_Args.Length /= 1 then
+               Fatal_Error ("exactly one argument is allowed: a filename for"
+                            & " the output checkpoint");
+            end if;
+            Output := new String'(+Args.Remaining_Args.First_Element);
 
          when others =>
             null;
@@ -968,6 +1024,11 @@ procedure GNATcov is
 
          if Object_Coverage_Enabled then
             --  Set routines from project, not supported yet???
+            null;
+
+         elsif Args.Command = Cmd_Instrument then
+            --  Instrumentation does not rely on ALI files, so no need to do
+            --  anything in this case.
             null;
 
          elsif Inputs.Length (ALIs_Inputs) = 0 then
@@ -1110,6 +1171,23 @@ procedure GNATcov is
       end;
    end Load_Target_Option;
 
+   ----------------------
+   -- Report_Bad_Trace --
+   ----------------------
+
+   procedure Report_Bad_Trace (Trace_Filename : String; Result : Read_Result)
+   is
+      Message : constant String :=
+         Trace_Filename & ": "
+         & Ada.Strings.Unbounded.To_String (Result.Error);
+   begin
+      if Keep_Reading_Traces then
+         Outputs.Error (Message);
+      else
+         Outputs.Fatal_Error (Message);
+      end if;
+   end Report_Bad_Trace;
+
    ------------------
    -- Show_Version --
    ------------------
@@ -1209,6 +1287,15 @@ begin
             Traces_Names.Disp_All_Routines_Of_Interest;
          end;
 
+      when Cmd_Instrument =>
+         if not Is_Project_Loaded then
+            Fatal_Error ("instrumentation requires a project file;"
+                         & " please use the -P option");
+         end if;
+
+         Instrument.Instrument_Units_Of_Interest
+           (Output.all, Units_Inputs, Args.Bool_Args (Opt_Auto_Dump_Buffers));
+
       when Cmd_Scan_Objects =>
          declare
 
@@ -1287,8 +1374,11 @@ begin
             procedure Dump_Trace_Base (Trace_File_Name : String) is
                Trace_File : constant Trace_File_Element_Acc :=
                  new Trace_File_Element;
+               Result     : Read_Result;
             begin
-               Read_Trace_File (Trace_File_Name, Trace_File.Trace, Base);
+               Read_Trace_File
+                 (Trace_File_Name, Trace_File.Trace, Result, Base);
+               Success_Or_Fatal_Error (Trace_File_Name, Result);
                Dump_Traces (Base);
             end Dump_Trace_Base;
 
@@ -1332,6 +1422,12 @@ begin
             Inputs.Iterate (Exe_Inputs, Open_Exec'Access);
             Inputs.Iterate (Trace_Inputs, Dump_Trace'Access);
          end;
+
+      when Cmd_Dump_Src_Trace =>
+         Check_Argument_Available (Trace_Inputs, "TRACE_FILE");
+         Inputs.Iterate
+           (Trace_Inputs,
+            Instrument.Input_Traces.Dump_Source_Trace_File'Access);
 
       when Cmd_Dump_Sections
         | Cmd_Dump_Symbols
@@ -1482,11 +1578,41 @@ begin
 
       when Cmd_Coverage =>
 
-         --  Validate combination of output format and coverage level
+         --  Make sure we have a coverage level
 
-         if Annotation = Annotate_Report and then Object_Coverage_Enabled then
-            Fatal_Error
-              ("Report output is supported for source coverage only.");
+         if not (Source_Coverage_Enabled or else Object_Coverage_Enabled)
+         then
+            Report_Missing_Argument ("a coverage level");
+         end if;
+
+         --  Reject the use of several features that are not supported with
+         --  object coverage.
+
+         if Object_Coverage_Enabled then
+            declare
+               procedure Unsupported (Label : String);
+               --  Raise a fatal error saying that Label is supported for
+               --  source coverage only.
+
+               -----------------
+               -- Unsupported --
+               -----------------
+
+               procedure Unsupported (Label : String) is
+               begin
+                  Fatal_Error
+                    (Label & " is supported for source coverage only.");
+               end Unsupported;
+            begin
+               if Annotation = Annotate_Report then
+                  Unsupported ("Report output");
+
+               elsif Inputs.Length (Checkpoints_Inputs) > 0
+                     or else Save_Checkpoint /= null
+               then
+                  Unsupported ("Incremental coverage");
+               end if;
+            end;
          end if;
 
          --  Validate availability of the output format
@@ -1498,15 +1624,6 @@ begin
               ("Dynamic HTML report format support is not installed.");
          end if;
 
-         --  Validate checkpoint related arguments and coverage level
-
-         if (Inputs.Length (Checkpoints_Inputs) > 0
-             or else Save_Checkpoint /= null)
-           and then not Source_Coverage_Enabled
-         then
-            Fatal_Error ("Incremental object coverage not supported");
-         end if;
-
          --  Load ALI files
 
          if Source_Coverage_Enabled then
@@ -1514,9 +1631,6 @@ begin
 
          elsif Object_Coverage_Enabled then
             Inputs.Iterate (ALIs_Inputs, Load_ALI'Access);
-
-         else
-            Report_Missing_Argument ("a coverage level");
          end if;
 
          --  Load routines from command line
@@ -1559,6 +1673,18 @@ begin
             --  Load a consolidated executable
 
             procedure Process_Trace
+              (Trace_File_Name    : String;
+               Exec_Name_Override : String);
+            --  Try to read Trace_File_Name. Depending on the probed trace file
+            --  kind, dispatch to Process_Binary_Trace or Process_Source_Trace.
+            --  If Trace_File_Name is an empty string, just dispatch to
+            --  Process_Binary_Trace (case of forcing the load of a program).
+
+            procedure Process_Source_Trace (Trace_File_Name : String);
+            --  Process the given source trace file, discharging SCIs
+            --  referenced by its coverage buffers.
+
+            procedure Process_Binary_Trace
               (Trace_File_Name    : String;
                Exec_Name_Override : String);
             --  Common dispatching point for object and source coverage:
@@ -1661,13 +1787,73 @@ begin
               (Trace_File_Name    : String;
                Exec_Name_Override : String)
             is
+               Kind   : Trace_File_Kind;
+               Result : Read_Result;
+            begin
+               if Trace_File_Name = "" then
+                  Process_Binary_Trace (Trace_File_Name, Exec_Name_Override);
+                  return;
+               end if;
+
+               Probe_Trace_File (Trace_File_Name, Kind, Result);
+               if not Result.Success then
+                  Report_Bad_Trace (Trace_File_Name, Result);
+               end if;
+
+               case Kind is
+                  when Binary_Trace_File =>
+                     Process_Binary_Trace
+                       (Trace_File_Name, Exec_Name_Override);
+                  when Source_Trace_File =>
+                     Process_Source_Trace (Trace_File_Name);
+               end case;
+            end Process_Trace;
+
+            --------------------------
+            -- Process_Source_Trace --
+            --------------------------
+
+            procedure Process_Source_Trace (Trace_File_Name : String) is
+               procedure Read_Source_Trace_File is new
+                  Instrument.Input_Traces.Generic_Read_Source_Trace_File
+                    (Compute_Source_Coverage);
+
+               Trace_File : Trace_File_Element_Acc;
+               Result     : Read_Result;
+            begin
+               --  Register the trace file, so it is included in coverage
+               --  reports.
+
+               Trace_File := new Trace_File_Element'
+                 (Kind            => Source_Trace_File,
+                  Context         => null,
+                  Filename        => new String'(Trace_File_Name));
+               Traces_Files_List.Files.Append (Trace_File);
+
+               --  We can now read it and import its data
+
+               Read_Source_Trace_File (Trace_File_Name, Result);
+               if not Result.Success then
+                  Report_Bad_Trace (Trace_File_Name, Result);
+               end if;
+            end Process_Source_Trace;
+
+            --------------------------
+            -- Process_Binary_Trace --
+            --------------------------
+
+            procedure Process_Binary_Trace
+              (Trace_File_Name    : String;
+               Exec_Name_Override : String)
+            is
                Trace_File : Trace_File_Element_Acc;
             begin
                if Trace_File_Name /= "" then
                   Trace_File := new Trace_File_Element'
-                    (From_Checkpoint => False,
-                     Filename        => new String'(Trace_File_Name),
-                     others          => <>);
+                    (Kind     => Binary_Trace_File,
+                     Context  => null,
+                     Filename => new String'(Trace_File_Name),
+                     others   => <>);
 
                   Traces_Files_List.Files.Append (Trace_File);
                else
@@ -1681,7 +1867,7 @@ begin
                   Process_Trace_For_Src_Coverage
                     (Trace_File, Exec_Name_Override);
                end if;
-            end Process_Trace;
+            end Process_Binary_Trace;
 
             ------------------------------------
             -- Process_Trace_For_Obj_Coverage --
@@ -1700,13 +1886,22 @@ begin
                if Trace_File = null then
                   Open_Exec (Exec_Name_Override, Text_Start, Exe_File);
                else
-                  Read_Trace_File
-                    (Trace_File.Filename.all, Trace_File.Trace, Base);
+                  declare
+                     Filename : String renames Trace_File.Filename.all;
+                     Result   : Read_Result;
+                  begin
+                     Read_Trace_File
+                       (Filename, Trace_File.Trace, Result, Base);
+                     if not Result.Success then
+                        Report_Bad_Trace (Filename, Result);
+                        return;
+                     end if;
+                  end;
 
-                  Exe_File :=
-                    Open_Exec_For_Trace (Trace_File.Filename.all,
-                               Trace_File.Trace,
-                               Exec_Name_Override);
+                  Exe_File := Open_Exec_For_Trace
+                    (Trace_File.Filename.all,
+                     Trace_File.Trace,
+                     Exec_Name_Override);
                end if;
 
                --  If there is no routine in list, get routine names from the
@@ -1744,7 +1939,9 @@ begin
                Current_Subp_Info       : aliased Subprogram_Info;
                Current_Subp_Info_Valid : Boolean;
 
-               procedure Process_Info_Entries (TF : Trace_File_Type);
+               procedure Process_Info_Entries
+                 (TF     : Trace_File_Type;
+                  Result : out Read_Result);
 
                function Load_Shared_Object
                   (TF          : Trace_File_Type;
@@ -1766,9 +1963,14 @@ begin
                -- Process_Info_Entries --
                --------------------------
 
-               procedure Process_Info_Entries (TF : Trace_File_Type) is
+               procedure Process_Info_Entries
+                 (TF     : Trace_File_Type;
+                  Result : out Read_Result) is
                begin
-                  Check_Trace_File_From_Exec (TF);
+                  Check_Trace_File_From_Exec (TF, Result);
+                  if not Result.Success then
+                     return;
+                  end if;
                   Exe_File := Open_Exec_For_Trace
                                 (Trace_File.Filename.all,
                                  TF,
@@ -1857,7 +2059,16 @@ begin
                   Open_Exec (Exec_Name_Override, Text_Start, Exe_File);
                   Decision_Map.Analyze (Exe_File);
                else
-                  Read_Trace_File (Trace_File.Filename.all, Trace_File.Trace);
+                  declare
+                     Filename : String renames Trace_File.Filename.all;
+                     Result   : Read_Result;
+                  begin
+                     Read_Trace_File (Filename, Trace_File.Trace, Result);
+                     if not Result.Success then
+                        Report_Bad_Trace (Filename, Result);
+                        return;
+                     end if;
+                  end;
                end if;
             end Process_Trace_For_Src_Coverage;
 
@@ -1896,7 +2107,6 @@ begin
                   Fatal_Error
                     ("Asm output supported for object coverage only.");
                end if;
-               Traces_Disa.Flag_Show_Asm := True;
                Traces_Dump.Dump_Routines_Traces (Output);
 
             when Annotate_Xml =>
@@ -1933,7 +2143,9 @@ begin
 
             if Save_Checkpoint /= null then
                Checkpoints.Checkpoint_Save
-                 (Save_Checkpoint.all, Context'Access);
+                 (Save_Checkpoint.all,
+                  Context'Access,
+                  Purpose => Checkpoints.Consolidation);
             end if;
          end;
 

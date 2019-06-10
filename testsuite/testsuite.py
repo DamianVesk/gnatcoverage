@@ -30,7 +30,8 @@ import os
 import re
 import sys
 
-from SUITE import cutils
+import SUITE.cutils as cutils
+
 from SUITE.cutils import strip_prefix, contents_of, FatalError, exit_if
 from SUITE.cutils import version
 
@@ -43,13 +44,26 @@ from SUITE.qdata import QLANGUAGES, QROOTDIR
 from SUITE.qdata import QSTRBOX_DIR, CTXDATA_FILE
 from SUITE.qdata import SUITE_context, TC_status, TOOL_info, OPT_info_from
 
-from SUITE import control
+import SUITE.control as control
+
 from SUITE.control import BUILDER, xcov_pgm
 from SUITE.control import altrun_opt_for, altrun_attr_for
 from SUITE.control import cargs_opt_for, cargs_attr_for
+
 from SUITE.vtree import DirTree
 
 DEFAULT_TIMEOUT = 600
+"""
+Default timeout to use (in seconds) to run testcases. Users can override this
+using gnatpython.main's --timeout command-line option.
+"""
+
+VALGRIND_TIMEOUT_FACTOR = 2
+"""
+When the testsuite runs with Valgrind (--enable-valgrind), the default timeout
+is multiplied by this number to get the actual default timeout. This is used to
+compensate the slowdown that Valgrind incurs.
+"""
 
 # ==========================================
 # == Qualification principles and control ==
@@ -104,6 +118,7 @@ class QlevelInfo(object):
         # qualification mode
         self.xcovlevel = xcovlevel
 
+
 RE_QCOMMON = "(Common|Appendix)"
 RE_QLANG = "(%s)" % '|'.join(QLANGUAGES)
 
@@ -116,6 +131,7 @@ def RE_SUBTREE(re_crit):
         "root": QROOTDIR, "common": RE_QCOMMON,
         "lang": RE_QLANG, "crit": re_crit
         }
+
 
 # Note that we expect test directory names to be in unix form here.
 # This is easy to achieve, will have obvious observable effects if not
@@ -166,26 +182,27 @@ QLEVEL_INFO = {
 # and reliable ways to determine the set of options we support and too many
 # possible sources for options is unwelcome.
 
-# On top of this user level control, we add a couple of flags such as
-# -fdump-scos automatically. Below is a sketch of the internal compilation
-# flags flow:
+# On top of this user level control, we add a couple of flags such as -g or
+# -fdump-scos automatically (depending on command line options, in particular
+# on the requested kind of trace mode). Below is a sketch of the internal
+# compilation flags flow:
 #
-#     gprfor ()
-#        template.gpr
-#        % Switches (main)   += "-fno-inline" as needed
-#        % Switches (<lang>) += SUITE.control.BUILDER.COMMON_CARGS
-#             |                 (-g -fdump-scos ...)
-#             |
-#             |   direct calls to gprbuild() from test.py,
-#             |   or via TestCase(extracargs)
-#             |       |
-#             v       v           testsuite.py
-#  gprbuild (gpr, extracargs)     [--cargs=<>] [--cargs:Ada=<>] [--cargs:C=<>]
-#                     |               |
-#                     o----> ADD <----o
-#                             |
-#                             v
-#     run "gprbuild -Pgpr -cargs=... [-cargs:Ada=<>] [-cargs:C=<>]
+#  SUITE.control.BUILDER.SCOV_CARGS(options) (-g -fdump-scos ...)
+#   |
+#   |      gprfor ()
+#   |        template.gpr
+#   |        % Switches (main)   += "-fno-inline" as needed
+#   |            |
+#   |            |   direct calls to gprbuild() from test.py,
+#   |            |   or via TestCase(extracargs)
+#   |            |       |
+#   |            v       v         testsuite.py
+#   |  gprbuild (gpr, extracargs)  [--cargs=<>] [--cargs:Ada=<>] [--cargs:C=<>]
+#   |                    |              |
+#   o--------------------o--------------o
+#                        |
+#                        v
+#   run "gprbuild -Pgpr -cargs=... [-cargs:Ada=<>] [-cargs:C=<>]
 
 # In addition to the SUITE.control bits, the only default option we enforce is
 # -gnat05 for Ada.
@@ -451,9 +468,11 @@ class TestSuite(object):
     # ------------------------
 
     def __init__(self):
-        """Prepare the testsuite run: parse options, compute and dump
+        """
+        Prepare the testsuite run: parse options, compute and dump
         discriminants, compute lists of dead/non-dead tests, run gprconfig and
-        build the support library for the whole series of tests to come"""
+        build the support library for the whole series of tests to come.
+        """
 
         # Latch our environment values, then setup the log directory and
         # initialize the GAIA log files. We need to do that before setting
@@ -612,11 +631,19 @@ class TestSuite(object):
         result = ['ALL'] + self.env.discriminants
         if which(self.tool('g++')):
             result.append('C++')
+
+        # Add a discriminant to track the current trace mode
+        result.append('src-traces'
+                      if self.env.main_options.trace_mode == 'src'
+                      else 'bin-traces')
+
         return result
 
     def __board_discriminants(self):
-        """Compute a list of string discriminants that convey a
-        request to run for a particular target board."""
+        """
+        Compute a list of string discriminants that convey a request to run for
+        a particular target board.
+        """
 
         # There are two possible sources for this, with slightly different
         # operational meanings but which don't need to be differentiated
@@ -631,10 +658,10 @@ class TestSuite(object):
         return ['board', boardname] if boardname else []
 
     def __cargs_discriminants(self):
-        """Compute a list of discriminants (string) for each switch passed in
-        all the --cargs command-line option(s).  The format of each
-        discriminant CARGS_<X> where <X> is the switch stripped of its
-        leading dashes.
+        """
+        Compute a list of discriminants (string) for each switch passed in all
+        the --cargs command-line option(s).  The format of each discriminant
+        CARGS_<X> where <X> is the switch stripped of its leading dashes.
 
         For instance, if this testsuite is called with --cargs='-O1'
         --cargs:Ada='-gnatp', then this function should return
@@ -652,9 +679,11 @@ class TestSuite(object):
         return ["CARGS_%s" % arg.lstrip('-') for arg in allopts.split()]
 
     def __qualif_level_discriminants(self):
-        """List of single discriminant (string) denoting our current
-        qualification mode, if any. This is ['XXX'] when invoked
-        with --qualif-level=XXX, [] otherwise"""
+        """
+        List of single discriminant (string) denoting our current qualification
+        mode, if any. This is ['XXX'] when invoked with --qualif-level=XXX, []
+        otherwise.
+        """
 
         return (
             [] if not self.env.main_options.qualif_level
@@ -662,9 +691,11 @@ class TestSuite(object):
             )
 
     def __rts_discriminants(self):
-        """Compute a list of discriminant strings that reflect the kind of
-        runtime support library in use, as conveyed by the --RTS command-line
-        option."""
+        """
+        Compute a list of discriminant strings that reflect the kind of runtime
+        support library in use, as conveyed by the --RTS command-line
+        option.
+        """
 
         # --RTS=zfp is strict zfp, missing malloc, memcmp, memcpy and put
 
@@ -692,18 +723,22 @@ class TestSuite(object):
             return ["RTS_FULL"]
 
     def __toolchain_discriminants(self):
-        """Compute the list of discriminants that reflects the version of the
-        particular toolchain in use. The match is on the sequence of three single
-        digits separated by dots after GNAT Pro."""
+        """
+        Compute the list of discriminants that reflects the version of the
+        particular toolchain in use. The match is on the sequence of three
+        single digits separated by dots after GNAT Pro.
+        """
 
         gcc_version = version(self.tool("gcc"))
-        m = re.search("GNAT Pro (\d\.\d\.\d)", gcc_version)
+        m = re.search(r"GNAT Pro (\d\.\d\.\d)", gcc_version)
         return [m.group(1)] if m else []
 
     def __generate_group(self, dirname, group_py):
-        """Helper for the "test.py" research: generate a tree of testcases for
-        the given "group.py" located in "dirname". Return whethet generation
-        was successful."""
+        """
+        Helper for the "test.py" research: generate a tree of testcases for the
+        given "group.py" located in "dirname". Return whethet generation was
+        successful.
+        """
 
         group_py_path = os.path.join(dirname, group_py)
         p = Run(
@@ -722,10 +757,12 @@ class TestSuite(object):
     # ---------------------
 
     def __next_testcase_from(self, root):
-        """Helper generator function for __next_testcase, producing a sequence
+        """
+        Helper generator function for __next_testcase, producing a sequence
         of testcases to be executed from a provided root directory, updating
         self.run_list and self.dead_list on the fly. The testcase path ids are
-        canonicalized into unix form here."""
+        canonicalized into unix form here.
+        """
 
         if not self.options.quiet:
             logging.info(
@@ -1008,8 +1045,15 @@ class TestSuite(object):
         if mopt.gprmode:
             testcase_cmd.append('--gprmode')
 
+        if mopt.trace_mode:
+            testcase_cmd.append('--trace-mode=%s' % mopt.trace_mode)
+
         if mopt.kernel:
             testcase_cmd.append('--kernel=%s' % mopt.kernel)
+
+        if mopt.trace_size_limit:
+            testcase_cmd.append(
+                '--trace-size-limit=%s' % mopt.trace_size_limit)
 
         if mopt.toolchain:
             testcase_cmd.append(
@@ -1062,7 +1106,12 @@ class TestSuite(object):
             test.start_time = time.time()
             return SKIP_EXECUTION
 
-        timeout = test.getopt('limit', default=DEFAULT_TIMEOUT)
+        # Compute the testcase timeout, whose default vary depending on whether
+        # we use Valgrind.
+        default_timeout = DEFAULT_TIMEOUT
+        if self.enable_valgrind:
+            default_timeout = VALGRIND_TIMEOUT_FACTOR * default_timeout
+        timeout = test.getopt('limit', default=default_timeout)
 
         self.maybe_exec(
             self.options.pre_testcase, args=[self.options.altrun],
@@ -1138,7 +1187,9 @@ class TestSuite(object):
         else:
             self.n_consecutive_failures = 0
 
-        if self.n_consecutive_failures >= 10:
+        if self.options.max_consecutive_failures > 0 and (
+            self.n_consecutive_failures >=
+                self.options.max_consecutive_failures):
             raise FatalError(
                 "Stopped after %d consecutive failures"
                 % self.n_consecutive_failures)
@@ -1267,6 +1318,12 @@ class TestSuite(object):
             raise FatalError(
                 "Missing -gnatec in cargs:Ada for qualification")
 
+        # Source traces require the use of project files to convey units of
+        # interest, which --gprmode will do:
+
+        if m.options.trace_mode == 'src':
+            m.options.gprmode = True
+
         # On some targets, we need to link with -lgnat for any executable
         # to run and the toolchain doesn't do it automatically in some cases
         # (e.g. C only programs). This is a workaround:
@@ -1274,6 +1331,16 @@ class TestSuite(object):
         if ((not m.options.toolchain) and m.options.target and
                 '-elf' in m.options.target):
             m.options.largs += " -lgnat"
+
+        # Hack: gnatpython.main uses 0 as the default value for
+        # --max-consecutive-failures. Here we want 10 by default, so if if we
+        # have the integer zero (default value), reset to 10, and if we have a
+        # string (explicit value), convert it to integer.
+        if m.options.max_consecutive_failures == 0:
+            m.options.max_consecutive_failures = 10
+        else:
+            m.options.max_consecutive_failures = int(
+                m.options.max_consecutive_failures)
 
         return m.options
 
@@ -1622,7 +1689,7 @@ class TestCase(object):
             for path in set(ls(os.path.join(self.atestdir, globp))):
                 try:
                     rm(path, recursive=True)
-                except:
+                except Exception:
                     handle_comment = self.__handle_info_for(path)
                     self.passed = False
                     self.status = 'RMFAILED'
@@ -1730,17 +1797,15 @@ class TestCase(object):
                 return lang
         return None
 
-# ======================
-# == Global functions ==
-# ======================
-
 
 def _quoted_argv():
-    """Return a list of command line options used to when invoking this
-    script.  The different with sys.argv is that the first entry (the
-    name of this script) is stripped, and that arguments that have a space
-    in them get quoted.  The goal is to be able to copy/past the quoted
-    argument in a shell and obtained the desired effect."""
+    """
+    Return a list of command line options used to when invoking this script.
+    The different with sys.argv is that the first entry (the name of this
+    script) is stripped, and that arguments that have a space in them get
+    quoted.  The goal is to be able to copy/past the quoted argument in a shell
+    and obtained the desired effect.
+    """
     quoted_args = []
     for arg in sys.argv[1:]:
         if ' ' in arg:
@@ -1754,13 +1819,9 @@ def _quoted_argv():
         quoted_args.append(quoted_arg)
     return quoted_args
 
-# =================
-# == script body ==
-# =================
-
-# Instanciate and run a TestSuite object ...
 
 if __name__ == "__main__":
+    # Instanciate and run a TestSuite object ...
     tso = TestSuite()
     tso.maybe_exec(bin=tso.options.pre_testsuite, edir="...")
     tso.run()

@@ -20,16 +20,15 @@ with Ada.Calendar.Formatting;
 with Ada.Characters.Handling; use Ada.Characters.Handling;
 with Ada.Containers.Vectors;
 with Ada.Strings.Unbounded;
-with Ada.Text_IO; use Ada.Text_IO;
+with Ada.Text_IO;             use Ada.Text_IO;
 
 with ALI_Files;
-with Coverage.Tags; use Coverage.Tags;
+with Coverage;        use Coverage;
+with Coverage.Source; use Coverage.Source;
+with Coverage.Tags;   use Coverage.Tags;
 with Qemu_Traces;
 with Switches;
-with Traces_Files_List;
-
-with Coverage.Source;
-use Coverage, Coverage.Source;
+with Traces_Files;    use Traces_Files;
 
 with Strings;  use Strings;
 
@@ -651,7 +650,6 @@ package body Annotations.Report is
       use Ada.Strings.Unbounded;
 
       use Qemu_Traces;
-      use Traces_Files_List;
       use Traces_Files_Lists;
 
       Output : constant File_Access := Get_Output;
@@ -665,18 +663,24 @@ package body Annotations.Report is
 
       procedure Display_Trace_File_Info (Position : Cursor) is
          E            : constant Trace_File_Element_Acc := Element (Position);
-         Orig_Context : constant String :=
-           Original_Processing_Context (E.Trace);
-
+         Orig_Context : constant String := Original_Processing_Context (E.all);
       begin
          New_Line (Output.all);
          Put_Line (Output.all, E.Filename.all);
-         Put_Line (Output.all, "  program  : "
-                   & Get_Info (E.Trace, Exec_File_Name));
-         Put_Line (Output.all, "  date     : "
-                   & Format_Date_Info (Get_Info (E.Trace, Date_Time)));
-         Put_Line (Output.all, "  tag      : "
-                   & Get_Info (E.Trace, User_Data));
+         Put_Line (Output.all, "  kind     : " & Image (E.Kind));
+
+         case E.Kind is
+            when Binary_Trace_File =>
+               Put_Line (Output.all, "  program  : "
+                         & Get_Info (E.Trace, Exec_File_Name));
+               Put_Line (Output.all, "  date     : "
+                         & Format_Date_Info (Get_Info (E.Trace, Date_Time)));
+               Put_Line (Output.all, "  tag      : "
+                         & Get_Info (E.Trace, User_Data));
+
+            when Source_Trace_File =>
+               null;
+         end case;
 
          --  For a trace that has been processed in an earlier run, provide
          --  information on original coverage assessment context.
@@ -763,9 +767,7 @@ package body Annotations.Report is
 
    function Section_Of_Message (M : Message) return Report_Section is
    begin
-      if M.SCO /= No_SCO_Id then
-         pragma Assert (M.Kind in Coverage_Kind);
-
+      if M.SCO /= No_SCO_Id and then M.Kind in Coverage_Kind then
          if M.Kind = Exclusion then
             return Coverage_Exclusions;
          else

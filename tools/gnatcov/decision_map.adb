@@ -2,7 +2,7 @@
 --                                                                          --
 --                               GNATcoverage                               --
 --                                                                          --
---                     Copyright (C) 2008-2017, AdaCore                     --
+--                     Copyright (C) 2008-2018, AdaCore                     --
 --                                                                          --
 -- GNATcoverage is free software; you can redistribute it and/or modify it  --
 -- under terms of the GNU General Public License as published by the  Free  --
@@ -48,6 +48,12 @@ with Traces_Names;      use Traces_Names;
 
 package body Decision_Map is
 
+   --  This unit instantiates containers and we want to avoid too much
+   --  performance cost when using references to their elements, so suppress
+   --  tampering checks.
+
+   pragma Suppress (Tampering_Check);
+
    use Ada.Containers;
    use Coverage;
 
@@ -70,6 +76,10 @@ package body Decision_Map is
    --  The decision occurrence map lists all object code occurrences of each
    --  source decision (identified by its SCO_Id).
 
+   function First_CBI_PC (D_Occ : Decision_Occurrence_Access) return Pc_Type;
+   --  Return the PC of the first conditional branch instruction in D_Occ.
+   --  Used as unique identifier for occurrences.
+
    package SCO_Sets is new Ada.Containers.Ordered_Sets (SCO_Id);
 
    type Call_Kind is (Normal, Raise_Exception, Finalizer);
@@ -79,6 +89,12 @@ package body Decision_Map is
    --    - calls to generated block finalizers / cleanup code
 
    --  A basic block in object code
+
+   package Outcome_Reached_Maps is new Ada.Containers.Ordered_Maps
+     (Key_Type     => Pc_Type,
+      Element_Type => Boolean);
+   --  Map of decision occurrence (identified by PC of first conditional
+   --  branch instruction) to Outcome_Reached status (see below).
 
    type Basic_Block is record
       From, To_PC, To  : Pc_Type := No_PC;
@@ -120,12 +136,17 @@ package body Decision_Map is
 
       --  Note that no two condition SCOs may be associated with a given PC.
 
-      Outcome_Reached        : Tristate := Unknown;
+      Outcome_Reached        : Outcome_Reached_Maps.Map;
       --  Set True for basic blocks that are reached after the outcome of the
       --  enclosing decision is determined: subsequent conditional branch
       --  instructions in the decision occurrence must be excluded from
       --  coverage analysis. Set False for basic blocks that are known to be
-      --  reachable while the outcome is not determined yet.
+      --  reachable while the outcome is not determined yet. Note that this
+      --  is computed per decision occurrence, because if two occurrences
+      --  of the same decision appear in close succession (e.g. inlined one
+      --  after the other, or possibly as part of an unrolled loop), the
+      --  initial (pre-outcome) basic block of the second occurrence might
+      --  need to be marked as a post-outcome block for the first one.
    end record;
 
    No_Basic_Block : constant Basic_Block := (others => <>);
@@ -242,6 +263,17 @@ package body Decision_Map is
 
    procedure Write_Map (Filename : String);
    --  Write the contents of the decision map to the named file
+
+   function Check_Possible_Successor
+     (D_SCO          : SCO_Id;
+      This_Condition : Any_Condition_Index;
+      Next_Condition : Condition_Index) return Tristate;
+   --  Determine whether Next_Condition is a valid successor of This_Condition
+   --  in the given decision, and if so, return the associated origin (i.e.
+   --  the associated valuation of This_Condition). If not, return Unknown.
+   --  This_Condition may be No_Condition_Index, in which case we check
+   --  whether Next_Condition is a valid first condition to be tested
+   --  (and return Unknown iff it's not).
 
    ---------
    -- "<" --
@@ -440,11 +472,21 @@ package body Decision_Map is
          Enclosing_D_SCO : SCO_Id;
          --  For a nested decision, the enclosing decision
 
-         DS_Top : Decision_Occurrence_Access;
-         --  Innermost currently open decision
+         Enclosing_Inlined_Body : Address_Info_Acc;
+         --  For a condition occurring in an inlined body, descriptor of that
+         --  body.
 
          Cond_Index : constant Condition_Index := Index (C_SCO);
          --  Index of C_SCO in D_SCO
+
+         Starting_Evaluation : constant Boolean :=
+           Is_Expected_First_Condition
+             (D_SCO, Condition (D_SCO, Cond_Index));
+         --  True if this condition can be the first one evaluated in
+         --  its decision.
+
+         DS_Top : Decision_Occurrence_Access;
+         --  Innermost currently open decision evaluation
 
          function Is_Expected_Condition
            (CI                   : Condition_Index;
@@ -466,27 +508,24 @@ package body Decision_Map is
             Report_If_Unexpected : Boolean := False) return Boolean
          is
             Current_CI  : Condition_Index renames DS_Top.Seen_Condition;
-            Last_CI     : Condition_Index renames DS_Top.Last_Cond_Index;
 
-            Next_Runtime_Cond   : SCO_Id;
-            Expected_Conditions : aliased SCO_Sets.Set;
-            Outcome             : Tristate;
          begin
+            if
+              --  Case of remaining in the current evaluation, or starting a
+              --  new one if there's none in progress.
 
-            --  Look for the next CI that is evaluated at runtime and skipped
-            --  conditions.
+              CI = Condition_Index'Max (Current_CI, 0)
 
-            Next_Runtime_Cond := Condition
-              (DS_Top.Decision,
-               Condition_Index'Min (Current_CI + 1, Last_CI));
-            Skip_Constant_Conditions
-              (Next_Runtime_Cond, Outcome, Expected_Conditions'Access);
+              --  Else the next condition is reachable through the fallthrough
+              --  edge of the current condition, so it must be a possible
+              --  successor.
 
-            if CI = Condition_Index'Max (Current_CI, 0)
-                  or else
-               CI = Index (Next_Runtime_Cond)
-                  or else
-               Expected_Conditions.Contains (Condition (DS_Top.Decision, CI))
+                or else
+              Check_Possible_Successor
+                (DS_Top.Decision,
+                 This_Condition => Current_CI,
+                 Next_Condition => CI) /= Unknown
+
             then
                return True;
             end if;
@@ -494,32 +533,11 @@ package body Decision_Map is
             if Report_If_Unexpected then
                declare
                   use Ada.Strings.Unbounded;
-                  use SCO_Sets;
-
                   Msg : Unbounded_String;
-                  Cur : SCO_Sets.Cursor;
                begin
                   Msg := To_Unbounded_String
-                    ("unexpected condition" & CI'Img & " (expected");
-
-                  if Current_CI >= 0 then
-                     Expected_Conditions.Include
-                       (Condition (DS_Top.Decision, Current_CI));
-                  end if;
-                  Expected_Conditions.Include (Next_Runtime_Cond);
-
-                  Cur := Expected_Conditions.First;
-                  while Cur /= No_Element loop
-                     Append
-                       (Msg,
-                        Condition_Index'Image (Index (Element (Cur))));
-                     Cur := Next (Cur);
-                     if Cur /= No_Element then
-                        Append (Msg, " or");
-                     end if;
-                  end loop;
-
-                  Append (Msg, ") in decision " & Image (DS_Top.Decision));
+                    ("unexpected condition" & CI'Img
+                     & " in decision " & Image (DS_Top.Decision));
 
                   if Tag /= No_SC_Tag then
                      Append (Msg, ", tag=" & Tag_Provider.Tag_Name (Tag));
@@ -545,6 +563,8 @@ package body Decision_Map is
       --  Start of processing for Process_Condition
 
       begin
+         --  Determine enclosing SCO
+
          Parent_SCO := Parent (D_SCO);
 
          if Parent_SCO /= No_SCO_Id
@@ -555,11 +575,18 @@ package body Decision_Map is
             Enclosing_D_SCO := No_SCO_Id;
          end if;
 
+         --  Determine innermost enclosing inlined body
+
+         Enclosing_Inlined_Body :=
+           Get_Address_Info
+             (Exec.all, Inlined_Subprogram_Addresses, Insn.First);
+
          --  Flush completed decisions from the Decision_Stack
 
          while Ctx.Decision_Stack.Length > 0 loop
             DS_Top := Ctx.Decision_Stack.Last_Element;
             exit when DS_Top.Decision = D_SCO
+              and then DS_Top.Inlined_Body = Enclosing_Inlined_Body
               and then Is_Expected_Condition (Cond_Index);
 
             if DS_Top.Decision = Enclosing_D_SCO then
@@ -572,13 +599,50 @@ package body Decision_Map is
                exit;
             end if;
 
-            --  If the condition being evaluated is one of the possible first
-            --  conditions in its decision, assume that we are starting a new
-            --  nested (or successive) evaluation.
+            --  If the condition being tested is the first of its decision,
+            --  then we may be starting a new decision occurrence: determine
+            --  whether it is nested in the current one.
 
-            exit when Is_Expected_First_Condition
-                        (D_SCO,
-                         Condition (D_SCO, Cond_Index));
+            if Starting_Evaluation then
+               if DS_Top.Seen_Condition = DS_Top.Last_Cond_Index
+                 and then DS_Top.Last_Cond_Index > 0
+               then
+                  --  Previous evaluation is complete: pop it
+
+                  null;
+
+               elsif DS_Top.Inlined_Body /= null
+                 and then Insn.First not in DS_Top.Inlined_Body.First
+                                         .. DS_Top.Inlined_Body.Last
+               then
+                  --  Exited inlined body of previous evaluation: pop it
+
+                  null;
+
+               else
+                  --  Nested decision: remain in current evaluation
+
+                  exit;
+               end if;
+
+            elsif (DS_Top.Inlined_Body = null
+                   and then Enclosing_Inlined_Body /= null)
+              or else
+                (DS_Top.Inlined_Body /= null
+                 and then Enclosing_Inlined_Body /= DS_Top.Inlined_Body
+                 and then Insn.First in DS_Top.Inlined_Body.First
+                                     .. DS_Top.Inlined_Body.Last)
+            then
+               --  Entering an inlined body: do not presume that the current
+               --  evaluation is completed.
+
+               exit;
+
+               --  Check whether call site loc is within current decision???
+               --  Difficulty: case of nested inlined calls, we need to find
+               --  the call site for the outermost call in that case???
+
+            end if;
 
             --  Otherwise pop completed evaluations from the stack until
             --  we find the relevant pending one.
@@ -588,8 +652,9 @@ package body Decision_Map is
             DS_Top := null;
          end loop;
 
-         if
+         --  Push a new occurrence on the evaluation stack, if needed
 
+         if
            --  No pending evaluation
 
            DS_Top = null
@@ -598,18 +663,47 @@ package body Decision_Map is
 
            or else DS_Top.Decision /= D_SCO
 
-           --  Nested/successive evaluation of the same decision
+           --  Start of evaluation in a new inlined body: cannot be the same
+           --  decision occurrence.
 
-           or else (DS_Top.Seen_Condition = DS_Top.Last_Cond_Index
-                    and then DS_Top.Last_Cond_Index > 0
-                    and then Cond_Index = 0)
+           or else (Starting_Evaluation
+                    and then DS_Top.Inlined_Body /= Enclosing_Inlined_Body)
 
          then
-            --  Push new context
+            declare
+               function Enclosing_Inlined_Body_Image return String;
+               --  Return information about enclosing inlined body if in one,
+               --  else null string.
+
+               ----------------------------------
+               -- Enclosing_Inlined_Body_Image --
+               ----------------------------------
+
+               function Enclosing_Inlined_Body_Image return String is
+               begin
+                  if Enclosing_Inlined_Body /= null then
+                     return " in inlined call from "
+                       & Image (Enclosing_Inlined_Body.Call_Sloc)
+                       & " ("
+                       & Hex_Image (Enclosing_Inlined_Body.First)
+                       & ".." & Hex_Image (Enclosing_Inlined_Body.Last) & ")";
+                  else
+                     return "";
+                  end if;
+               end Enclosing_Inlined_Body_Image;
+
+            begin
+               Report (Exec, Insn.First,
+                       "starting occurrence"
+                       & Enclosing_Inlined_Body_Image,
+                       SCO  => D_SCO,
+                       Kind => Notice);
+            end;
 
             DS_Top := new Decision_Occurrence'
               (Last_Cond_Index => Last_Cond_Index (D_SCO),
                Decision        => D_SCO,
+               Inlined_Body    => Enclosing_Inlined_Body,
                others          => <>);
             Ctx.Decision_Stack.Append (DS_Top);
          end if;
@@ -777,6 +871,8 @@ package body Decision_Map is
       Ctx   : in out Cond_Branch_Context;
       D_Occ : Decision_Occurrence_Access)
    is
+      First_Seen_Condition_PC : constant Pc_Type :=
+                                  D_Occ.Conditional_Branches.First_Element;
       Last_Seen_Condition_PC : constant Pc_Type :=
                                  D_Occ.Conditional_Branches.Last_Element;
 
@@ -945,58 +1041,6 @@ package body Decision_Map is
          Edge_Name : constant String := Edge'Img;
          Edge_Info : Cond_Edge_Info renames CBI.Edges (Edge);
 
-         function Check_Possible_Successor
-           (Next_Condition : Condition_Index) return Tristate;
-         --  Determine whether Next_Condition is a valid successor for the
-         --  currently tested condition (CBI.Condition), and if so, return
-         --  the associated origin.
-
-         ------------------------------
-         -- Check_Possible_Successor --
-         ------------------------------
-
-         function Check_Possible_Successor
-           (Next_Condition : Condition_Index) return Tristate
-         is
-         begin
-            for J in Boolean'Range loop
-               declare
-                  use SCO_Sets;
-
-                  Next_Condition_SCO  : constant SCO_Id := Condition
-                    (D_Occ.Decision, Next_Condition);
-
-                  Next_C              : SCO_Id;
-                  Outcome             : Tristate;
-                  Possible_Successors : aliased SCO_Sets.Set;
-               begin
-                  --  Go to the next condition with the J valuation for the
-                  --  current condition, and skip constant conditions if any.
-
-                  Next_C := SC_Obligations.Next_Condition (CBI.Condition, J);
-                  Skip_Constant_Conditions
-                    (Next_C, Outcome, Possible_Successors'Access);
-
-                  --  If there is a match between the resulting condition and
-                  --  the given Next_Condition, return the tried valuation.
-
-                  if (Next_C /= No_SCO_Id
-                        and then Index (Next_C) = Next_Condition)
-                     or else Possible_Successors.Contains (Next_Condition_SCO)
-                  then
-                     return To_Tristate (J);
-                  end if;
-               end;
-            end loop;
-
-            --  If we end up here, no valuation enabled us to reach
-            --  Next_Condition.
-
-            return Unknown;
-         end Check_Possible_Successor;
-
-      --  Start of processing for Label_Destination
-
       begin
          --  Check for known edge with this destination. Destination info will
          --  be set upon return if destination is known.
@@ -1153,8 +1197,10 @@ package body Decision_Map is
 
             declare
                Condition_Origin : constant Tristate :=
-                                    Check_Possible_Successor
-                                      (Edge_Info.Next_Condition);
+                 Check_Possible_Successor
+                   (D_Occ.Decision,
+                    This_Condition => Index (CBI.Condition),
+                    Next_Condition => Edge_Info.Next_Condition);
             begin
                if Condition_Origin /= Unknown then
                   Set_Known_Origin
@@ -1233,38 +1279,19 @@ package body Decision_Map is
 
             BB := Element (Cur);
             BB_D_SCO := Decision_Of_Jump (BB.To_PC);
-            if BB_D_SCO /= D_Occ.Decision then
+            if BB_D_SCO /= D_Occ.Decision  then
                return;
             end if;
 
-            case BB.Outcome_Reached is
-               when Unknown =>
-                  BB.Outcome_Reached := To_Tristate (Outcome_Reached);
-                  Ctx.Basic_Blocks.Replace_Element (Cur, BB);
+            --  Here BB is a basic block reachable from the current decision,
+            --  and whose last PC is also in the decision. Note however that
+            --  it might be the first BB in a distinct inlined occurrence.
 
-                  --  Recurse on target if unconditional branch, or if
-                  --  outcome known.
-
-                  if Outcome_Reached or else not BB.Cond then
-                     Mark_Successors (BB.Branch_Dest.Target, Outcome_Reached);
-                  end if;
-
-                  --  Fallthrough is also excluded if branch is conditional,
-                  --  or if the branch is a call that returns.
-
-                  if (Outcome_Reached and then BB.Cond)
-                       or else
-                     (BB.Branch = Br_Call and then BB.Call /= Raise_Exception)
-                  then
-                     Next_PC := BB.FT_Dest.Target;
-                     goto Tail_Recurse;
-                  end if;
-
-               when True =>
+            if BB.Outcome_Reached.Contains (First_Seen_Condition_PC) then
+               if BB.Outcome_Reached.Element (First_Seen_Condition_PC) then
                   null;
 
-               when False =>
-
+               elsif Outcome_Reached and then not BB.First_Cond then
                   --  Reject attempt to exclude (i.e. mark as post-outcome)
                   --  a basic block that is already known to be pre-outcome.
                   --  Generate a warning in that case, except in the case where
@@ -1273,13 +1300,35 @@ package body Decision_Map is
                   --  branching to a new evaluation of the decision (for the
                   --  next loop iteration).
 
-                  if Outcome_Reached and then not BB.First_Cond then
-                     Report (Exe, Cond_Branch_PC,
-                             "tried to exclude pre-outcome basic block at "
-                             & Hex_Image (Next_PC),
-                             Kind => Diagnostics.Error);
-                  end if;
-            end case;
+                  Report (Exe, Cond_Branch_PC,
+                          "tried to exclude pre-outcome basic block at "
+                          & Hex_Image (Next_PC),
+                          Kind => Diagnostics.Error);
+               end if;
+
+            else
+               BB.Outcome_Reached.Include
+                 (First_Seen_Condition_PC, Outcome_Reached);
+               Ctx.Basic_Blocks.Replace_Element (Cur, BB);
+
+               --  Recurse on target if unconditional branch, or if
+               --  outcome known.
+
+               if Outcome_Reached or else not BB.Cond then
+                  Mark_Successors (BB.Branch_Dest.Target, Outcome_Reached);
+               end if;
+
+               --  Fallthrough is also excluded if branch is conditional,
+               --  or if the branch is a call that returns.
+
+               if (Outcome_Reached and then BB.Cond)
+                 or else
+                   (BB.Branch = Br_Call and then BB.Call /= Raise_Exception)
+               then
+                  Next_PC := BB.FT_Dest.Target;
+                  goto Tail_Recurse;
+               end if;
+            end if;
          end Mark_Successors;
 
          Labeling_Complete : Boolean;
@@ -1304,27 +1353,50 @@ package body Decision_Map is
          declare
             use Basic_Block_Sets;
 
-            Cur : constant Cursor :=
-                   Find_Basic_Block (Ctx.Basic_Blocks, Cond_Branch_PC);
-            BB  : Basic_Block := Element (Cur);
+            BB_Cur : constant Cursor :=
+                       Find_Basic_Block (Ctx.Basic_Blocks, Cond_Branch_PC);
+            BB     : Basic_Block := Element (BB_Cur);
+
+            function BB_Outcome_Reached return Tristate;
+            --  Return outcome reached status recorded in BB for this decision
+            --  occurrence.
+
+            ------------------------
+            -- BB_Outcome_Reached --
+            ------------------------
+
+            function BB_Outcome_Reached return Tristate is
+               use Outcome_Reached_Maps;
+
+               OR_Cur : constant Outcome_Reached_Maps.Cursor :=
+                 BB.Outcome_Reached.Find (First_Seen_Condition_PC);
+            begin
+               if OR_Cur = Outcome_Reached_Maps.No_Element then
+                  return Unknown;
+               else
+                  return To_Tristate (Element (OR_Cur));
+               end if;
+            end BB_Outcome_Reached;
+
          begin
             if First_Cond_Branch then
-               if BB.Outcome_Reached = Unknown then
+               if BB_Outcome_Reached = Unknown then
                   --  Mark this BB as being the first one in the decision
                   --  occurrence, and therefore necessarily pre-outcome.
 
                   BB.First_Cond := True;
-                  BB.Outcome_Reached := False;
-
-                  Ctx.Basic_Blocks.Replace_Element (Cur, BB);
+                  BB.Outcome_Reached.Include (First_Seen_Condition_PC, False);
+                  Ctx.Basic_Blocks.Replace_Element (BB_Cur, BB);
                end if;
-               pragma Assert (BB.Outcome_Reached = False);
+               pragma Assert (BB_Outcome_Reached = False);
             end if;
 
-            if BB.Outcome_Reached = True then
+            if BB_Outcome_Reached = True then
                CBI.Condition := No_SCO_Id;
                Report (Exe, Cond_Branch_PC,
-                       "skipping post-outcome branch", Kind => Notice);
+                       "skipping post-outcome branch"
+                       & " in BB @" & Hex_Image (BB.From),
+                       Kind => Notice);
                return;
             end if;
          end;
@@ -1754,7 +1826,7 @@ package body Decision_Map is
          --  structure (presence of multiple paths) or if Debug_Full_History
          --  is set.
 
-         if Has_Diamond (Enclosing_Decision (CBI.Condition))
+         if Has_Multipath_Condition (Enclosing_Decision (CBI.Condition))
            or else Debug_Full_History
          then
             Add_Entry
@@ -2132,13 +2204,19 @@ package body Decision_Map is
    --  Start of processing for Analyze_Decision_Occurrence
 
    begin
+      Report (Exe, First_CBI_PC (D_Occ),
+              "analyzing occurrence",
+              SCO  => D_Occ.Decision,
+              Kind => Notice);
+
       --  Detect and report incomplete occurrences (i.e. occurrence where the
       --  last seen condition is not the last run-time-evaluated condition of
       --  the decision). In this case we bail out.
 
       if not Is_Last_Runtime_Condition (D_Occ) then
          Report (Exe, Last_Seen_Condition_PC,
-                 "incomplete occurrence of " & Image (D_Occ.Decision));
+                 "incomplete occurrence",
+                 SCO => D_Occ.Decision);
          return;
       end if;
 
@@ -2586,6 +2664,28 @@ package body Decision_Map is
                declare
                   CBK : Cond_Branch_Kind;
 
+                  function Is_Cleanup_CBI return Boolean;
+                  --  A conditional branch instruction that is post-outcome
+                  --  for at least one decision occurrence, and pre-outcome
+                  --  for none, is part of cleanup actions.
+
+                  --------------------
+                  -- Is_Cleanup_CBI --
+                  --------------------
+
+                  function Is_Cleanup_CBI return Boolean is
+                     Pre_Outcome, Post_Outcome : Boolean := False;
+                  begin
+                     for Outcome_Reached of BB.Outcome_Reached loop
+                        if Outcome_Reached then
+                           Post_Outcome := True;
+                        else
+                           Pre_Outcome := True;
+                        end if;
+                     end loop;
+                     return Post_Outcome and not Pre_Outcome;
+                  end Is_Cleanup_CBI;
+
                begin
                   if BB.Branch_SCO = No_SCO_Id then
                      CBK := None;
@@ -2600,7 +2700,7 @@ package body Decision_Map is
                            & S_Kind (BB.Branch_SCO)'Img);
                      end if;
 
-                  elsif BB.Outcome_Reached = True then
+                  elsif Is_Cleanup_CBI then
                      CBK := Cleanup;
 
                   else
@@ -2712,37 +2812,15 @@ package body Decision_Map is
    --------------------------------
 
    procedure Append_Decision_Occurrence (D_Occ : Decision_Occurrence_Access) is
-
-      procedure Update_Element
-        (SCO : SCO_Id;
-         V   : in out Decision_Occurrence_Vectors.Vector);
-      --  Append D_Occ to V
-
-      --------------------
-      -- Update_Element --
-      --------------------
-
-      procedure Update_Element
-        (SCO : SCO_Id;
-         V   : in out Decision_Occurrence_Vectors.Vector)
-      is
-         pragma Unreferenced (SCO);
-      begin
-         V.Append (D_Occ);
-      end Update_Element;
-
       use Decision_Occurrence_Maps;
       Cur : constant Cursor := Decision_Occurrence_Map.Find (D_Occ.Decision);
-
-   --  Start of processing for Append_Decision_Occurrence
-
    begin
       if Cur = Decision_Occurrence_Maps.No_Element then
          Decision_Occurrence_Map.Insert
            (Key      => D_Occ.Decision,
             New_Item => Decision_Occurrence_Vectors.To_Vector (D_Occ, 1));
       else
-         Decision_Occurrence_Map.Update_Element (Cur, Update_Element'Access);
+         Decision_Occurrence_Map.Reference (Cur).Append (D_Occ);
       end if;
    end Append_Decision_Occurrence;
 
@@ -2763,6 +2841,63 @@ package body Decision_Map is
       Analyze (Exec);
       Decision_Map.Write_Map (Map_Filename);
    end Build_Decision_Map;
+
+   ------------------------------
+   -- Check_Possible_Successor --
+   ------------------------------
+
+   function Check_Possible_Successor
+     (D_SCO          : SCO_Id;
+      This_Condition : Any_Condition_Index;
+      Next_Condition : Condition_Index) return Tristate
+   is
+   begin
+      --  If This_Condition is No_Condition_Index, iterate just once with an
+      --  arbitrary for J, else check both valuations of the current condition.
+
+      for J in False .. (This_Condition /= No_Condition_Index) loop
+         declare
+            use SCO_Sets;
+
+            Next_Condition_SCO  : constant SCO_Id :=
+              Condition (D_SCO, Next_Condition);
+
+            Next_C              : SCO_Id;
+            Outcome             : Tristate;
+            Possible_Successors : aliased SCO_Sets.Set;
+         begin
+            if This_Condition = No_Condition_Index then
+               --  Initial condition
+
+               Next_C := Condition (D_SCO, 0);
+            else
+               --  Go to the next condition with the J valuation for the
+               --  current condition, and skip constant conditions if any.
+
+               Next_C := SC_Obligations.Next_Condition
+                           (Condition (D_SCO, This_Condition), J);
+            end if;
+
+            Skip_Constant_Conditions
+              (Next_C, Outcome, Possible_Successors'Access);
+
+            --  If there is a match between the resulting condition and
+            --  the given Next_Condition, return the tried valuation.
+
+            if (Next_C /= No_SCO_Id
+                and then Index (Next_C) = Next_Condition)
+              or else Possible_Successors.Contains (Next_Condition_SCO)
+            then
+               return To_Tristate (J);
+            end if;
+         end;
+      end loop;
+
+      --  If we end up here, no valuation enabled us to reach
+      --  Next_Condition.
+
+      return Unknown;
+   end Check_Possible_Successor;
 
    ----------------------
    -- Find_Basic_Block --
@@ -2798,6 +2933,15 @@ package body Decision_Map is
          return No_Basic_Block;
       end if;
    end Find_Basic_Block;
+
+   ------------------
+   -- First_CBI_PC --
+   ------------------
+
+   function First_CBI_PC (D_Occ : Decision_Occurrence_Access) return Pc_Type is
+   begin
+      return D_Occ.Conditional_Branches.First_Element;
+   end First_CBI_PC;
 
    -----------
    -- Image --

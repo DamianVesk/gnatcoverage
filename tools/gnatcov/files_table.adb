@@ -20,6 +20,7 @@ with Ada.Containers.Hashed_Maps;
 with Ada.Characters.Handling;
 with Ada.Containers.Ordered_Sets;
 with Ada.Directories;
+with Ada.Streams.Stream_IO;
 with Ada.Unchecked_Deallocation;
 
 with System;
@@ -37,6 +38,8 @@ with Switches;
 
 package body Files_Table is
 
+   subtype Stream_Access is Ada.Streams.Stream_IO.Stream_Access;
+
    procedure Free is new Ada.Unchecked_Deallocation
      (File_Info, File_Info_Access);
 
@@ -44,19 +47,29 @@ package body Files_Table is
      (Index_Type   => Valid_Source_File_Index,
       Element_Type => File_Info_Access);
 
-   Files_Table           : File_Vectors.Vector;
+   Files_Table : File_Vectors.Vector;
 
-   Unique_Names_Computed : Boolean := False;
-   --  Whether Unique_Name fields for element of Files_Table have been
-   --  computed. It is invalid to add files to the table after this is set
-   --  to True.
+   Files_Table_Frozen : Boolean := False;
+   --  Whether Files_Table is frozen. When it's frozen, we can compute
+   --  Unique_Name fields for its elements and we can build Sorted_Files_Table.
+   --  It is invalid to add files to the table after this is set to True.
 
    Empty_Sloc_To_SCO_Map : aliased constant Sloc_To_SCO_Maps.Map :=
       Sloc_To_SCO_Maps.Empty_Map;
 
-   procedure Build_Unique_Names;
-   --  Compute unique names for all files in the table. Also take care of
-   --  setting Unique_Names_Computed.
+   type Sorted_File_Index is new Valid_Source_File_Index;
+
+   package File_Index_Vectors is new Ada.Containers.Vectors
+     (Index_Type   => Sorted_File_Index,
+      Element_Type => Valid_Source_File_Index);
+
+   Sorted_Files_Table : File_Index_Vectors.Vector;
+   --  Sorted list of indexes corresponding to Files_Table entries. Files are
+   --  sorted by simple name first, then by full name. Computed when freezing
+   --  Files_Table.
+
+   procedure Freeze_Files_Table;
+   --  Freeze the files table and compute Unique_Name fields for file entries
 
    function Create_File_Info
      (Kind                   : File_Kind;
@@ -517,7 +530,8 @@ package body Files_Table is
    procedure Files_Table_Iterate
      (Process : not null access procedure (Index : Source_File_Index)) is
    begin
-      for Index in Files_Table.First_Index .. Files_Table.Last_Index loop
+      Freeze_Files_Table;
+      for Index of Sorted_Files_Table loop
          Process (Index);
       end loop;
    end Files_Table_Iterate;
@@ -545,7 +559,7 @@ package body Files_Table is
    ---------------------
 
    procedure Fill_Line_Cache (FI : File_Info_Access) is
-      F          : File_Type;
+      F          : Ada.Text_IO.File_Type;
       Has_Source : Boolean;
       Line       : Natural := 1;
       LI         : Line_Info_Access;
@@ -594,16 +608,17 @@ package body Files_Table is
    -- Get_Full_Name --
    -------------------
 
-   function Get_Full_Name (Index : Source_File_Index) return String is
-      Full_Name : constant String_Access :=
-        Files_Table.Element (Index).Full_Name;
+   function Get_Full_Name
+     (Index : Source_File_Index; Or_Simple : Boolean := False) return String
+   is
+      File : File_Info renames Files_Table.Element (Index).all;
    begin
-      if Full_Name /= null then
-         return Full_Name.all;
+      if File.Full_Name /= null then
+         return File.Full_Name.all;
+      elsif Or_Simple then
+         return File.Simple_Name.all;
       else
-         Outputs.Fatal_Error ("No full path name for "
-                              & Files_Table.Element (Index).Simple_Name.all);
-         return "";
+         Outputs.Fatal_Error ("No full path name for " & File.Simple_Name.all);
       end if;
    end Get_Full_Name;
 
@@ -686,7 +701,7 @@ package body Files_Table is
 
          --  If we reach this point, we are inserting a new file into the table
 
-         pragma Assert (not Unique_Names_Computed);
+         pragma Assert (not Files_Table_Frozen);
 
          Files_Table.Append (Create_File_Info
            (Kind,
@@ -751,7 +766,7 @@ package body Files_Table is
          Res := No_Source_File;
 
       else
-         pragma Assert (not Unique_Names_Computed);
+         pragma Assert (not Files_Table_Frozen);
 
          Files_Table.Append (Create_File_Info
            (Kind                => Kind,
@@ -873,10 +888,10 @@ package body Files_Table is
    end Get_Simple_Name;
 
    ------------------------
-   -- Build_Unique_Names --
+   -- Freeze_Files_Table --
    ------------------------
 
-   procedure Build_Unique_Names is
+   procedure Freeze_Files_Table is
 
       package Conversions is new System.Address_To_Access_Conversions
         (Object => File_Info);
@@ -1063,9 +1078,13 @@ package body Files_Table is
       Alias_Map : Alias_Maps.Map;
       --  Mapping: simple name to set of files that have this simple name
 
-   --  Start of processing for Build_Unique_Names
+   --  Start of processing for Freeze_Files_Table
 
    begin
+      if Files_Table_Frozen then
+         return;
+      end if;
+
       --  First, build the alias map: conflicting files will get grouped under
       --  a single alias set.
 
@@ -1124,9 +1143,49 @@ package body Files_Table is
          end loop;
       end loop;
 
+      --  Fill Sorted_Files_Table with all indexes from the files table, and
+      --  then sort these indexes according to the referenced file names.
+
+      declare
+
+         function Appears_Before
+           (Left, Right : Valid_Source_File_Index) return Boolean;
+         --  Return whether Left should appear before Right in
+         --  Sorted_Files_Table.
+
+         --------------------
+         -- Appears_Before --
+         --------------------
+
+         function Appears_Before
+           (Left, Right : Valid_Source_File_Index) return Boolean
+         is
+            L : File_Info renames Files_Table.Element (Left).all;
+            R : File_Info renames Files_Table.Element (Right).all;
+         begin
+            if L.Simple_Name.all = R.Simple_Name.all then
+               return L.Full_Name /= null
+                      and then R.Full_Name /= null
+                      and then L.Full_Name.all < R.Full_Name.all;
+            else
+               return L.Simple_Name.all < R.Simple_Name.all;
+            end if;
+         end Appears_Before;
+
+         package Sorting is new File_Index_Vectors.Generic_Sorting
+           ("<" => Appears_Before);
+
+      begin
+         Sorted_Files_Table.Reserve_Capacity (Files_Table.Length);
+         for Index in Files_Table.First_Index .. Files_Table.Last_Index loop
+            Sorted_Files_Table.Append (Index);
+         end loop;
+         Sorting.Sort (Sorted_Files_Table);
+      end;
+
       Clear (Alias_Map);
-      Unique_Names_Computed := True;
-   end Build_Unique_Names;
+      Files_Table_Frozen := True;
+   end Freeze_Files_Table;
 
    ---------------------
    -- Get_Unique_Name --
@@ -1134,12 +1193,8 @@ package body Files_Table is
 
    function Get_Unique_Name (Index : Source_File_Index) return String is
       File : File_Info renames Get_File (Index).all;
-
    begin
-      if not Unique_Names_Computed then
-         Build_Unique_Names;
-      end if;
-
+      Freeze_Files_Table;
       return File.Unique_Name.all;
    end Get_Unique_Name;
 
@@ -1185,7 +1240,7 @@ package body Files_Table is
 
          --  We have a more specific kind of file: change the kind of FI
 
-         pragma Assert (not Unique_Names_Computed);
+         pragma Assert (not Files_Table_Frozen);
 
          if Switches.Debug_File_Table then
             declare
@@ -1309,7 +1364,6 @@ package body Files_Table is
       FI      : File_Info_Access;
       Success : out Boolean)
    is
-
       procedure Try_Open
         (File    : in out File_Type;
          Name    : String;
@@ -1323,7 +1377,7 @@ package body Files_Table is
       --------------
 
       procedure Try_Open
-        (File    : in out File_Type;
+        (File    : in out Ada.Text_IO.File_Type;
          Name    : String;
          Success : out Boolean) is
       begin
@@ -1518,7 +1572,8 @@ package body Files_Table is
    -- Checkpoint_Save --
    ---------------------
 
-   procedure Checkpoint_Save (S : access Root_Stream_Type'Class) is
+   procedure Checkpoint_Save (CSS : access Checkpoint_Save_State) is
+      S : Stream_Access renames CSS.Stream;
    begin
       --  1) Output first and last SFIs
 
@@ -1554,10 +1609,9 @@ package body Files_Table is
    -- Checkpoint_Load --
    ---------------------
 
-   procedure Checkpoint_Load
-     (S  : access Root_Stream_Type'Class;
-      CS : access Checkpoint_State)
-   is
+   procedure Checkpoint_Load (CLS : access Checkpoint_Load_State) is
+      S : Stream_Access renames CLS.Stream;
+
       --  1) Read header
 
       CP_First_SFI : constant Source_File_Index := Source_File_Index'Input (S);
@@ -1585,7 +1639,7 @@ package body Files_Table is
       --  Kill bogus infinite loop warning (P324-050)
 
    begin
-      CS.SFI_Map :=
+      CLS.SFI_Map :=
         new SFI_Map_Array'(CP_First_SFI .. CP_Last_SFI => No_Source_File);
 
       --  We first load all file entries, and then import them into the
@@ -1667,10 +1721,10 @@ package body Files_Table is
                   end if;
                end if;
 
-               CS.SFI_Map (CP_SFI) := SFI;
+               CLS.SFI_Map (CP_SFI) := SFI;
                if Switches.Verbose then
                   Put_Line ("Remap " & FE.Name.all & ":" & CP_SFI'Img
-                            & " ->" & CS.SFI_Map (CP_SFI)'Img);
+                            & " ->" & CLS.SFI_Map (CP_SFI)'Img);
                end if;
             end if;
          end;

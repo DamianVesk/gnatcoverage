@@ -94,17 +94,26 @@ def check_xcov_reports(xcov_filename_pattern, expected_cov):
     def fmt_sorted_indented_list(items):
         return '\n'.join('  {}'.format(s) for s in sorted(items))
 
-    xcov_files = {f for f in glob.glob(xcov_filename_pattern)}
-    thistest.stop_if(
+    # Avoid discrepancies between filenames on Windows and Unix. Although it is
+    # not the canonical representation, Windows supports using slash as
+    # separators, so use it.
+    def canonicalize_file(filename):
+        return filename.replace('\\', '/')
+
+    xcov_files = {canonicalize_file(filename)
+                  for filename in glob.glob(xcov_filename_pattern)}
+    expected_cov = {canonicalize_file(filename): cov_data
+                    for filename, cov_data in expected_cov.iteritems()}
+
+    thistest.fail_if(
         xcov_files != set(expected_cov),
-        FatalError(
-            'Unexpected XCOV files. Expected:\n'
-            '{}\n'
-            'But got instead:\n'
-            '{}\n'.format(fmt_sorted_indented_list(expected_cov),
-                          fmt_sorted_indented_list(xcov_files))
-        )
+        'Unexpected XCOV files. Expected:\n'
+        '{}\n'
+        'But got instead:\n'
+        '{}\n'.format(fmt_sorted_indented_list(expected_cov),
+                      fmt_sorted_indented_list(xcov_files))
     )
 
     for filename, cov_data in expected_cov.items():
-        check_xcov_content(filename, cov_data)
+        if filename in xcov_files:
+            check_xcov_content(filename, cov_data)

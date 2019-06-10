@@ -44,6 +44,7 @@ package Command_Line is
       Cmd_Dump_Trace_Raw,
       Cmd_Dump_Trace_Base,
       Cmd_Dump_Trace_Asm,
+      Cmd_Dump_Src_Trace,
       Cmd_Dump_Sections,
       Cmd_Dump_Symbols,
       Cmd_Dump_Compile_Units,
@@ -55,7 +56,9 @@ package Command_Line is
       Cmd_Disassemble_Insn_Properties,
       Cmd_Disassemble_Raw,
       Cmd_Disassemble,
-      Cmd_Scan_Objects);
+      Cmd_Scan_Objects,
+
+      Cmd_Instrument);
    --  Set of commands we support. More complete descriptions below.
 
    type Bool_Options is
@@ -68,7 +71,10 @@ package Command_Line is
       Opt_Branch_Stats,
       Opt_Excluded_SCOs,
       Opt_Keep_Edges,
-      Opt_Pretty_Print);
+      Opt_Pretty_Print,
+      Opt_Keep_Reading_Traces,
+      Opt_Auto_Dump_Buffers,
+      Opt_Externally_Built_Projects);
    --  Set of boolean options we support. More complete descriptions below.
 
    type String_Options is
@@ -200,6 +206,12 @@ package Command_Line is
          Description => ("Display of trace files with assembly code for each"
                          & " trace."),
          Internal    => True),
+      Cmd_Dump_Src_Trace => Create
+        (Name        => "dump-src-trace",
+         Pattern     => "[TRACE_FILEs]",
+         Description => "Dump the content of a source trace file in a human-"
+                        & "-readable text form",
+         Internal    => True),
       Cmd_Dump_Sections => Create
         (Name        => "dump-sections",
          Pattern     => "[EXEs]",
@@ -277,6 +289,12 @@ package Command_Line is
          Pattern     => "[FILEs]",
          Description => ("Scan object FILEs for empty symbols or orphan"
                          & " regions."),
+         Internal    => True),
+      Cmd_Instrument => Create
+        (Name        => "instrument",
+         Pattern     => "[CHECKPOINT]",
+         Description => ("Instrument the given project and produce the"
+                         & " associated checkpoint."),
          Internal    => True));
 
    Bool_Infos : constant Bool_Option_Info_Array :=
@@ -289,7 +307,8 @@ package Command_Line is
          Help       => ("In addition to those designated by -P/--projects,"
                         & " consider units from any transitively imported"
                         & " project."),
-         Commands   => (Cmd_Run | Cmd_Coverage | Cmd_Dump_CFG => True,
+         Commands   => (Cmd_Run | Cmd_Coverage | Cmd_Instrument
+                           | Cmd_Dump_CFG => True,
                         others => False),
          Internal   => False),
       Opt_All_Decisions => Create
@@ -344,7 +363,37 @@ package Command_Line is
          Help      => "Output a pretty-printed JSON to ease debugging.",
          Commands  => (Cmd_Disassemble_Insn_Properties => True,
                        others => False),
-         Internal  => True));
+         Internal  => True),
+
+      Opt_Keep_Reading_Traces => Create
+        (Long_Name => "--keep-reading-traces",
+         Help      => "When an error occurs while reading a trace file,"
+                      & " skip it and keep reading other trace files until a"
+                      & " coverage report can be produced. Note that this"
+                      & " makes gnatcov exit with an error status.",
+         Commands  => (Cmd_Coverage => True,
+                       others       => False),
+         Internal  => False),
+
+      Opt_Auto_Dump_Buffers => Create
+        (Long_Name => "--auto-dump-buffers",
+         Help      => "Append a call to System.GNATcov.Traces.Output"
+                      & ".Write_Trace_File in all mains in the project. Note"
+                      & " that this also instruments mains that are the units"
+                      & " of interest."
+                      & ASCII.LF & ASCII.LF
+                      & "The call to Write_Trace_File dumps coverage buffers"
+                      & " for all units of interest in the main closure.",
+         Commands  => (Cmd_Instrument => True,
+                       others         => False),
+         Internal  => True),
+
+      Opt_Externally_Built_Projects => Create
+        (Long_Name => "--externally-built-projects",
+         Help      => "Process projects marked as externally built.",
+         Commands  => (Cmd_Run | Cmd_Coverage | Cmd_Dump_CFG => True,
+                       others                                => False),
+         Internal  => False));
 
    String_Infos : constant String_Option_Info_Array :=
      (Opt_Project => Create
@@ -440,7 +489,8 @@ package Command_Line is
          Help         => ("Specify coverage levels. LEVEL is one of:"
                           & ASCII.LF
                           & "  " & Coverage.Valid_Coverage_Options),
-         Commands     => (Cmd_Run | Cmd_Coverage | Cmd_Convert => True,
+         Commands     => (Cmd_Run | Cmd_Coverage | Cmd_Convert
+                             | Cmd_Instrument => True,
                           others => False),
          At_Most_Once => False,
          Internal     => False),
@@ -584,7 +634,7 @@ package Command_Line is
          Help        => ("State the set of units of interest by name,"
                          & " overriding the GPR-based selection by -P, etc."),
          Commands    => (Cmd_Run | Cmd_Coverage | Cmd_Scan_Decisions
-                             | Cmd_Map_Routines => True,
+                             | Cmd_Map_Routines | Cmd_Instrument => True,
                          others => False),
          Internal    => False),
       Opt_Routines => Create

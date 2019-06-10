@@ -16,24 +16,22 @@
 -- of the license.                                                          --
 ------------------------------------------------------------------------------
 
-with Ada.Streams.Stream_IO; use Ada.Streams, Ada.Streams.Stream_IO;
+with Ada.Streams.Stream_IO; use Ada.Streams.Stream_IO;
 with Ada.Unchecked_Deallocation;
-
-with Interfaces;
 
 with Coverage.Source;
 with Files_Table;
+with Instrument.Common;
 with Outputs;           use Outputs;
 with Traces_Files_List;
 
 package body Checkpoints is
 
-   Checkpoint_Magic   : constant String := "GNATcov checkpoint" & ASCII.NUL;
-   Checkpoint_Version : constant := 1;
+   Checkpoint_Magic : constant String := "GNATcov checkpoint" & ASCII.NUL;
 
    type Checkpoint_Header is record
       Magic   : String (1 .. Checkpoint_Magic'Length) := Checkpoint_Magic;
-      Version : Interfaces.Unsigned_32 := Checkpoint_Version;
+      Version : Interfaces.Unsigned_32;
    end record;
 
    procedure Free is
@@ -49,20 +47,46 @@ package body Checkpoints is
 
    procedure Checkpoint_Save
      (Filename : String;
-      Context  : access Coverage.Context)
+      Context  : access Coverage.Context;
+      Purpose  : Checkpoint_Purpose;
+      Version  : Checkpoint_Version := Default_Checkpoint_Version)
    is
-      SF : Ada.Streams.Stream_IO.File_Type;
-      S  : Stream_Access;
-
+      SF  : Ada.Streams.Stream_IO.File_Type;
    begin
+      if Purpose = Instrumentation and then Version < 2 then
+         raise Program_Error
+           with "instrumentation checkpoints must be at least version 2";
+      end if;
+
       Create (SF, Out_File, Filename);
-      S := Stream (SF);
-      Checkpoint_Header'Write (S, (others => <>));
-      Coverage.Levels_Type'Write (S, Coverage.Current_Levels);
-      Files_Table.Checkpoint_Save (S);
-      SC_Obligations.Checkpoint_Save (S);
-      Coverage.Source.Checkpoint_Save (S);
-      Traces_Files_List.Checkpoint_Save (S, Context);
+
+      declare
+         use Coverage;
+
+         CSS              : aliased Checkpoint_Save_State :=
+           (Root_Stream_Type with Stream => Stream (SF), Version => Version);
+         Supported_Levels : Levels_Type := Current_Levels;
+      begin
+         Checkpoint_Header'Write
+           (CSS.Stream, (Version => Version, others => <>));
+
+         --  Instrumentation is the same for all MC/DC variants, so a
+         --  checkpoint generated for any of them supports all of them.
+
+         if Purpose = Instrumentation and then MCDC_Coverage_Enabled then
+            Supported_Levels (MCDC_Coverage_Level'Range) := (others => True);
+         end if;
+         Coverage.Levels_Type'Write (CSS.Stream, Supported_Levels);
+
+         Files_Table.Checkpoint_Save (CSS'Access);
+         SC_Obligations.Checkpoint_Save (CSS'Access);
+         if not Version_Less (CSS'Access, Than => 2) then
+            Instrument.Common.Checkpoint_Save (CSS'Access);
+         end if;
+         Coverage.Source.Checkpoint_Save (CSS'Access);
+         Traces_Files_List.Checkpoint_Save (CSS'Access, Context);
+      end;
+
       Close (SF);
    end Checkpoint_Save;
 
@@ -71,69 +95,96 @@ package body Checkpoints is
    ---------------------
 
    procedure Checkpoint_Load (Filename : String) is
-      use type Interfaces.Unsigned_32;
-
-      SF     : Ada.Streams.Stream_IO.File_Type;
-      S      : Stream_Access;
-      CS     : aliased Checkpoint_State;
-      Levels : Coverage.Levels_Type;
-
-      Expected_Header, CP_Header : Checkpoint_Header;
+      SF        : Ada.Streams.Stream_IO.File_Type;
+      CP_Header : Checkpoint_Header;
+      Levels    : Coverage.Levels_Type;
 
    begin
-      CS.Filename := To_Unbounded_String (Filename);
-
       Open (SF, In_File, Filename);
-      S := Stream (SF);
 
-      Checkpoint_Header'Read (S, CP_Header);
-      if CP_Header.Magic /= Expected_Header.Magic then
-         Fatal_Error ("invalid checkpoint file " & Filename);
+      declare
+         CLS : aliased Checkpoint_Load_State :=
+           (Root_Stream_Type with Stream => Stream (SF), others => <>);
+      begin
+         CLS.Filename := To_Unbounded_String (Filename);
 
-      elsif CP_Header.Version /= Expected_Header.Version then
-         Fatal_Error
-           ("incompatible checkpoint version "
-            & "(expected" & Expected_Header.Version'Img
-            & ", found"   & CP_Header.Version'Img & ")");
+         Checkpoint_Header'Read (CLS.Stream, CP_Header);
+         if CP_Header.Magic /= Checkpoint_Magic then
+            Fatal_Error ("invalid checkpoint file " & Filename);
 
-      else
-         Coverage.Levels_Type'Read (S, Levels);
-         declare
-            Error_Msg : constant String :=
-               Coverage.Is_Load_Allowed (Filename, Levels);
-         begin
-            if Error_Msg'Length > 0 then
-               Fatal_Error (Error_Msg);
+         elsif CP_Header.Version not in Checkpoint_Version then
+            Fatal_Error
+              ("invalid checkpoint version" & CP_Header.Version'Img);
+
+         else
+            CLS.Version := CP_Header.Version;
+            Coverage.Levels_Type'Read (CLS.Stream, Levels);
+            declare
+               Error_Msg : constant String :=
+                 Coverage.Is_Load_Allowed (Filename, Levels);
+            begin
+               if Error_Msg'Length > 0 then
+                  Fatal_Error (Error_Msg);
+               end if;
+            end;
+
+            Files_Table.Checkpoint_Load (CLS'Access);
+            SC_Obligations.Checkpoint_Load (CLS'Access);
+            if not Version_Less (CLS'Access, Than => 2) then
+               Instrument.Common.Checkpoint_Load (CLS'Access);
             end if;
-         end;
+            Coverage.Source.Checkpoint_Load (CLS'Access);
+            Traces_Files_List.Checkpoint_Load (CLS'Access);
 
-         Files_Table.Checkpoint_Load (S, CS'Access);
-         SC_Obligations.Checkpoint_Load (S, CS'Access);
-         Coverage.Source.Checkpoint_Load (S, CS'Access);
-         Traces_Files_List.Checkpoint_Load (S, CS'Access);
-         Free (CS.SFI_Map);
-         Free (CS.SCO_Map);
-         Free (CS.Inst_Map);
-      end if;
+            Free (CLS.SFI_Map);
+            Free (CLS.SCO_Map);
+            Free (CLS.Inst_Map);
+         end if;
+      end;
 
       Close (SF);
    end Checkpoint_Load;
+
+   ----------
+   -- Read --
+   ----------
+
+   procedure Read
+     (Stream : in out Stateful_Stream;
+      Item   : out Stream_Element_Array;
+      Last   : out Stream_Element_Offset)
+   is
+   begin
+      Stream.Stream.Read (Item, Last);
+   end Read;
 
    ---------------
    -- Remap_SFI --
    ---------------
 
    procedure Remap_SFI
-     (CS                 : access Checkpoint_State;
+     (CLS                : Checkpoint_Load_State'Class;
       CP_SFI             : in out Source_File_Index;
       Require_Valid_File : Boolean := True)
    is
    begin
       if CP_SFI /= No_Source_File then
-         CP_SFI := CS.SFI_Map (CP_SFI);
+         CP_SFI := CLS.SFI_Map (CP_SFI);
          pragma Assert
            (not Require_Valid_File or else CP_SFI /= No_Source_File);
       end if;
    end Remap_SFI;
+
+   -----------
+   -- Write --
+   -----------
+
+   procedure Write
+     (Stream : in out Stateful_Stream;
+      Item   : Stream_Element_Array)
+   is
+   begin
+      Stream.Stream.Write (Item);
+   end Write;
 
 end Checkpoints;

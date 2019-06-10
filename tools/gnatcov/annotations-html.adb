@@ -20,12 +20,12 @@ with Ada.Characters.Handling;
 with Ada.Integer_Text_IO;
 with Ada.Text_IO;           use Ada.Text_IO;
 
-with Hex_Images;  use Hex_Images;
-with Traces_Disa; use Traces_Disa;
-with Traces_Files_List;
+with Hex_Images;   use Hex_Images;
+with Traces_Disa;  use Traces_Disa;
+with Traces_Files; use Traces_Files;
 with Qemu_Traces;
-with Coverage;    use Coverage;
-with Outputs;     use Outputs;
+with Coverage;     use Coverage;
+with Outputs;      use Outputs;
 
 package body Annotations.Html is
    type String_Cst_Acc is access constant String;
@@ -420,7 +420,6 @@ package body Annotations.Html is
 
    procedure Pretty_Print_Start (Pp : in out Html_Pretty_Printer) is
       use Qemu_Traces;
-      use Traces_Files_List;
       use Traces_Files_Lists;
 
       procedure Pi (S : String);
@@ -474,6 +473,7 @@ package body Annotations.Html is
       Pi ("  <table cellspacing=""1"" class=""TracesFiles"">");
       Pi ("    <tr class=""Head"">");
       Pi ("      <td>Trace Filename</td>");
+      Pi ("      <td>Kind</td>");
       Pi ("      <td>Program</td>");
       Pi ("      <td>Date</td>");
       Pi ("      <td>Tag</td>");
@@ -484,10 +484,22 @@ package body Annotations.Html is
          El := Element (Cur);
          Pi ("    <tr>");
          Pi ("      <td>" & El.Filename.all & "</td>");
-         Pi ("      <td>" & Get_Info (El.Trace, Exec_File_Name) & "</td>");
-         Pi ("      <td>" & Format_Date_Info (Get_Info (El.Trace, Date_Time))
-               & "</td>");
-         Pi ("      <td>" & Get_Info (El.Trace, User_Data) & "</td>");
+         Pi ("      <td>" & Image (El.Kind) & "</td>");
+
+         case El.Kind is
+            when Binary_Trace_File =>
+               Pi ("      <td>" & Get_Info (El.Trace, Exec_File_Name)
+                   & "</td>");
+               Pi ("      <td>"
+                   & Format_Date_Info (Get_Info (El.Trace, Date_Time))
+                   & "</td>");
+               Pi ("      <td>" & Get_Info (El.Trace, User_Data) & "</td>");
+
+            when Source_Trace_File =>
+               Pi ("      <td></td>");
+               Pi ("      <td></td>");
+               Pi ("      <td></td>");
+         end case;
          Pi ("    </tr>");
          Next (Cur);
       end loop;

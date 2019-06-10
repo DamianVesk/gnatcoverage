@@ -2,7 +2,7 @@
 --                                                                          --
 --                               GNATcoverage                               --
 --                                                                          --
---                     Copyright (C) 2009-2017, AdaCore                     --
+--                     Copyright (C) 2009-2018, AdaCore                     --
 --                                                                          --
 -- GNATcoverage is free software; you can redistribute it and/or modify it  --
 -- under terms of the GNU General Public License as published by the  Free  --
@@ -18,6 +18,7 @@
 
 with Ada.Containers.Vectors;
 with Ada.Containers.Ordered_Sets;
+with Ada.Streams; use Ada.Streams;
 with Ada.Tags;
 with Ada.Unchecked_Deallocation;
 
@@ -28,6 +29,7 @@ with Coverage.Tags;     use Coverage.Tags;
 with Decision_Map;      use Decision_Map;
 with Diagnostics;       use Diagnostics;
 with Elf_Disassemblers; use Elf_Disassemblers;
+with Instrument.Common; use Instrument.Common;
 with MC_DC;             use MC_DC;
 with Outputs;           use Outputs;
 with Slocs;             use Slocs;
@@ -37,6 +39,12 @@ with Traces_Elf;        use Traces_Elf;
 with Types;
 
 package body Coverage.Source is
+
+   --  This unit instantiates containers and we want to avoid too much
+   --  performance cost when using references to their elements, so suppress
+   --  tampering checks.
+
+   pragma Suppress (Tampering_Check);
 
    use Ada.Containers;
 
@@ -207,20 +215,17 @@ package body Coverage.Source is
    -- Checkpoint_Save --
    ---------------------
 
-   procedure Checkpoint_Save (S : access Root_Stream_Type'Class) is
+   procedure Checkpoint_Save (CSS : access Checkpoint_Save_State) is
    begin
-      Ada.Tags.Tag'Write (S, Tag_Provider'Tag);
-      SCI_Vector_Vectors.Vector'Write (S, SCI_Vector);
+      Ada.Tags.Tag'Write (CSS.Stream, Tag_Provider'Tag);
+      SCI_Vector_Vectors.Vector'Write (CSS.Stream, SCI_Vector);
    end Checkpoint_Save;
 
    ---------------------
    -- Checkpoint_Load --
    ---------------------
 
-   procedure Checkpoint_Load
-     (S  : access Root_Stream_Type'Class;
-      CS : access Checkpoint_State)
-   is
+   procedure Checkpoint_Load (CLS : access Checkpoint_Load_State) is
       use type Ada.Tags.Tag;
       use SCI_Vector_Vectors;
 
@@ -232,7 +237,7 @@ package body Coverage.Source is
       --  tag provider is the default (i.e. no coverage separation), or same
       --  as checkpoint.
 
-      Ada.Tags.Tag'Read (S, CP_Tag_Provider);
+      Ada.Tags.Tag'Read (CLS, CP_Tag_Provider);
       if Tag_Provider.all not in Default_Tag_Provider_Type
         and then Tag_Provider'Tag /= CP_Tag_Provider
       then
@@ -246,35 +251,18 @@ package body Coverage.Source is
 
       Initialize_SCI;
 
-      SCI_Vector_Vectors.Vector'Read (S, CP_SCI_Vector);
+      SCI_Vector_Vectors.Vector'Read (CLS, CP_SCI_Vector);
       for SCO_Cur in CP_SCI_Vector.Iterate loop
          Process_One_SCO : declare
             CP_SCO : constant SCO_Id := To_Index (SCO_Cur);
-            SCO    : constant SCO_Id := CS.SCO_Map (CP_SCO);
-
-            procedure Free_SCIs (SCIV : in out SCI_Vectors.Vector);
-            --  Deallocate all elements in SCIV
-
-            ---------------
-            -- Free_SCIs --
-            ---------------
-
-            procedure Free_SCIs (SCIV : in out SCI_Vectors.Vector) is
-            begin
-               for CP_SCI of SCIV loop
-                  Free (CP_SCI);
-               end loop;
-            end Free_SCIs;
-
-         --  Start of processing for Process_One_SCO
-
+            SCO    : constant SCO_Id := CLS.SCO_Map (CP_SCO);
          begin
             if SCO /= No_SCO_Id then
                for CP_SCI of Element (SCO_Cur) loop
                   if CP_SCI /= null then
                      Merge_Checkpoint_SCI
                        (SCO,
-                        Tag_Provider.Map_Tag (CS.all, CP_SCI.Tag),
+                        Tag_Provider.Map_Tag (CLS.all, CP_SCI.Tag),
                         CP_SCI.all);
                   end if;
                end loop;
@@ -283,7 +271,14 @@ package body Coverage.Source is
             --  Deallocate checkpoint SCIs for this SCO once they have been
             --  merged into the main SCI vector.
 
-            CP_SCI_Vector.Update_Element (SCO_Cur, Free_SCIs'Access);
+            declare
+               SCIV : SCI_Vectors.Vector renames
+                  CP_SCI_Vector.Reference (SCO_Cur);
+            begin
+               for CP_SCI of SCIV loop
+                  Free (CP_SCI);
+               end loop;
+            end;
          end Process_One_SCO;
       end loop;
    end Checkpoint_Load;
@@ -314,27 +309,16 @@ package body Coverage.Source is
       for SCO of Line_Info.SCOs.all loop
          SCOs_Of_Line : declare
             SCO_State : Line_State := No_Code;
+         begin
+            --  Make sure we have at least one SCI for this SCO
 
-            procedure Ensure_SCI (SCIV : in out SCI_Vectors.Vector);
-            --  If SCIV is empty, add a SCI with no tag
-
-            ----------------
-            -- Ensure_SCI --
-            ----------------
-
-            procedure Ensure_SCI (SCIV : in out SCI_Vectors.Vector) is
+            declare
+               SCIV : SCI_Vectors.Vector renames SCI_Vector.Reference (SCO);
             begin
                if SCIV.Length = 0 then
                   SCIV.Append (new Source_Coverage_Info (Kind => Kind (SCO)));
                end if;
-            end Ensure_SCI;
-
-         --  Start of processing for SCOs_Of_Line
-
-         begin
-            --  Make sure we have at least one SCI for this SCO
-
-            SCI_Vector.Update_Element (SCO, Ensure_SCI'Access);
+            end;
 
             --  Iterate over all SCIs for this SCO
 
@@ -365,7 +349,7 @@ package body Coverage.Source is
                      --  has been seen for the entire unit, this means that
                      --  the user probably omitted required tests for that
                      --  unit, so in that case we do not enter this branch
-                     --  (because Unit_Had_Code is False), and so we end up
+                     --  (because Unit_Has_Code is False), and so we end up
                      --  conservatively marking all statements in the unit as
                      --  not covered (on the basis that they might end up
                      --  having code, and be marked  as not covered, when the
@@ -380,6 +364,11 @@ package body Coverage.Source is
                      --  omitted at link time, so we don't know for sure
                      --  whether or not the compiler emitted code for that SCO,
                      --  so we conservatively assume that it might have.
+
+                     --  For source instrumentation, Unit_Has_Code is set when
+                     --  we load coverage buffers for the unit, and
+                     --  Basic_Block_Has_Code is set when there is a statement
+                     --  SCO bit for this statement SCO (or one it dominates).
 
                      if Report_If_Excluded (SCO) then
                         SCO_State := Not_Coverable;
@@ -811,9 +800,9 @@ package body Coverage.Source is
                --  Mark S_SCO as executed
 
                Report
-                 (Msg  => (if Line_Executed then "line " else "")
-                            & "executed" & Tag_Suffix
-                            & (if Propagating then " (propagating)" else ""),
+                 ((if Line_Executed then "line " else "")
+                  & "executed" & Tag_Suffix
+                  & (if Propagating then " (propagating)" else ""),
                   SCO  => S_SCO,
                   Exe  => Exe,
                   PC   => PC,
@@ -835,8 +824,8 @@ package body Coverage.Source is
               and then not Get_SCI (Dom_SCO, Tag).Known_Outcome_Taken (Dom_Val)
             then
                Report
-                 (Msg  => "outcome " & Dom_Val'Img & " taken" & Tag_Suffix
-                            & " (propagating)",
+                 ("outcome " & Dom_Val'Img & " taken" & Tag_Suffix
+                  & " (propagating)",
                   SCO  => Dom_SCO,
                   Exe  => Exe,
                   PC   => PC,
@@ -896,7 +885,7 @@ package body Coverage.Source is
 
                   Inferred_Values : Vector;
                   --  Inferred condition values, for the case of a D_SCO with
-                  --  no diamond.
+                  --  no condition reachable through multile paths.
 
                   function Pop_Eval return Evaluation;
                   --  Pop the top element from the evaluation stack
@@ -931,11 +920,11 @@ package body Coverage.Source is
                   SCI.Outcome_Taken (To_Boolean (CBE.Outcome)) := True;
 
                   Report
-                    (Msg  => "outcome " & CBE.Outcome'Img
-                             & (if Degraded_Origins (D_SCO)
-                                then " (degraded)"
-                                else "")
-                             & " taken by " & E'Img,
+                    ("outcome " & CBE.Outcome'Img
+                     & (if Degraded_Origins (D_SCO)
+                       then " (degraded)"
+                       else "")
+                     & " taken by " & E'Img,
                      SCO  => D_SCO,
                      Exe  => Exe,
                      PC   => PC,
@@ -949,14 +938,13 @@ package body Coverage.Source is
                      return;
                   end if;
 
-                  if Has_Diamond (D_SCO) then
+                  if Has_Multipath_Condition (D_SCO) then
                      Eval := Pop_Eval;
 
                   else
-                     --  Decision has no diamond: each condition is reachable
-                     --  through only one path, and we can infer the complete
-                     --  condition vector from just the last condition being
-                     --  tested.
+                     --  Each condition is reachable through only one path,
+                     --  and we can infer the complete condition vector from
+                     --  just the last condition tested.
 
                      Inferred_Values := Infer_Values (SCO);
                      Inferred_Values.Append (CBE.Origin);
@@ -1022,7 +1010,9 @@ package body Coverage.Source is
                           "edge " & E'Img & " raised an exception, "
                           & "abandoning evaluation", Kind => Notice);
 
-                        if Has_Diamond (D_SCO) or else Debug_Full_History then
+                        if Has_Multipath_Condition (D_SCO)
+                          or else Debug_Full_History
+                        then
                            Evaluation_Stack.Delete_Last;
                         end if;
 
@@ -1072,7 +1062,7 @@ package body Coverage.Source is
 
                when 3 =>
                   if MCDC_Coverage_Enabled
-                       and then (Has_Diamond (D_SCO)
+                       and then (Has_Multipath_Condition (D_SCO)
                                    or else Debug_Full_History)
                   then
                      --  For MC/DC we need full historical traces, not just
@@ -1195,6 +1185,160 @@ package body Coverage.Source is
       end loop Trace_Insns;
    end Compute_Source_Coverage;
 
+   procedure Compute_Source_Coverage
+     (Closure_Hash    : Instrument.Input_Traces.Hash_Type;
+      Unit_Name       : String;
+      Unit_Part       : GNATCOLL.Projects.Unit_Parts;
+      Stmt_Buffer     : Coverage_Buffer;
+      Decision_Buffer : Coverage_Buffer;
+      MCDC_Buffer     : Coverage_Buffer)
+   is
+      pragma Unreferenced (Closure_Hash);
+
+      CU : CU_Id;
+      BM : CU_Bit_Maps;
+
+      procedure Set_Executed (SCI : in out Source_Coverage_Info);
+      --  Mark SCI as executed
+
+      function Part_Image (Part : GNATCOLL.Projects.Unit_Parts) return String;
+      --  Helper to include Part in an error message
+
+      function Unit_Image return String is
+        (Part_Image (Unit_Part) & " " & Unit_Name);
+      --  Helper to refer to the instrumented unit in an error message
+
+      ------------------
+      -- Set_Executed --
+      ------------------
+
+      procedure Set_Executed (SCI : in out Source_Coverage_Info) is
+      begin
+         SCI.Executed := True;
+      end Set_Executed;
+
+      ----------------
+      -- Part_Image --
+      ----------------
+
+      function Part_Image (Part : GNATCOLL.Projects.Unit_Parts) return String
+      is
+         use all type GNATCOLL.Projects.Unit_Parts;
+      begin
+         return (case Part is
+                 when Unit_Body => "body of",
+                 when Unit_Spec => "spec of",
+                 when Unit_Separate => "separate");
+      end Part_Image;
+
+   --  Start of processing for Compute_Source_Coverage
+
+   begin
+      CU := Find_Instrumented_Unit (Unit_Name, Unit_Part);
+      if CU = No_CU_Id then
+         Fatal_Error ("unknown instrumented unit: " & Unit_Image);
+
+      elsif Provider (CU) /= Instrumenter then
+
+         --  We loaded compiler-generated SCOs for this unit before processing
+         --  its source trace buffer, so we have inconsistent information. Just
+         --  ignore this coverage information and proceed.
+
+         Warn ("inconsistent coverage method, ignoring coverage information"
+               & " for " & Unit_Image);
+         return;
+      end if;
+
+      --  Mark unit as present in closure
+
+      Set_Unit_Has_Code (CU);
+
+      --  Sanity check that Closure_Hash is consistent with what the
+      --  instrumenter recorded in the CU info.
+      --  ??? TBD
+
+      --  Discharge SCOs based on source traces
+
+      BM := Bit_Maps (CU);
+
+      for J in Stmt_Buffer'Range loop
+
+         --  TODO??? Currently we hard-code No_SC_Tag.
+         --  Need to add support for per-instance coverage
+
+         --  Mark SCO as coverable (there is a bit referencing it)
+
+         Set_Basic_Block_Has_Code (BM.Statement_Bits (J), No_SC_Tag);
+
+         --  If bit is set, statement has been executed
+
+         if Stmt_Buffer (J) then
+            Update_SCI (BM.Statement_Bits (J), No_SC_Tag, Set_Executed'Access);
+         end if;
+      end loop;
+
+      for J in Decision_Buffer'Range loop
+         if Decision_Buffer (J) then
+            declare
+               Outcome_Info : Decision_Bit_Info renames BM.Decision_Bits (J);
+
+               procedure Set_Known_Outcome_Taken
+                 (SCI : in out Source_Coverage_Info);
+               --  Mark Outcome_Info.Outcome as taken
+
+               -----------------------------
+               -- Set_Known_Outcome_Taken --
+               -----------------------------
+
+               procedure Set_Known_Outcome_Taken
+                 (SCI : in out Source_Coverage_Info) is
+               begin
+                  SCI.Known_Outcome_Taken (Outcome_Info.Outcome) := True;
+               end Set_Known_Outcome_Taken;
+
+            begin
+               Update_SCI
+                 (Outcome_Info.D_SCO, No_SC_Tag,
+                  Set_Known_Outcome_Taken'Access);
+
+               --  TODO??? Currently we hard-code No_SC_Tag.
+               --  Need to add support for per-instance coverage
+            end;
+         end if;
+      end loop;
+
+      for J in MCDC_Buffer'Range loop
+         if MCDC_Buffer (J) then
+            declare
+               MCDC_Info   : MCDC_Bit_Info renames BM.MCDC_Bits (J);
+               Outcome     : Boolean;
+               Cond_Values : constant Condition_Values_Array :=
+                 Condition_Values
+                   (MCDC_Info.D_SCO, MCDC_Info.Path_Index, Outcome);
+
+               procedure Add_Evaluation (SCI : in out Source_Coverage_Info);
+               --  Add evaluation to SCI
+
+               --------------------
+               -- Add_Evaluation --
+               --------------------
+
+               procedure Add_Evaluation (SCI : in out Source_Coverage_Info) is
+               begin
+                  SCI.Evaluations.Include
+                    ((Decision       => MCDC_Info.D_SCO,
+                      Values         => To_Vector (Cond_Values),
+                      Outcome        => To_Tristate (Outcome),
+                      Next_Condition => No_Condition_Index));
+               end Add_Evaluation;
+
+            begin
+               Update_SCI (MCDC_Info.D_SCO, No_SC_Tag, Add_Evaluation'Access);
+            end;
+         end if;
+      end loop;
+   end Compute_Source_Coverage;
+
    -------------------------
    -- Condition_Evaluated --
    -------------------------
@@ -1210,10 +1354,6 @@ package body Coverage.Source is
       function In_Current_Evaluation return Boolean;
       --  True when this evaluation is the expected next condition in the
       --  evaluation at the top of the evaluation stack.
-
-      procedure Update_Current_Evaluation (ES_Top : in out Evaluation);
-      --  Record the value of condition C_SCO in the current evaluation, and
-      --  set the next expected condition.
 
       ---------------------------
       -- In_Current_Evaluation --
@@ -1233,11 +1373,43 @@ package body Coverage.Source is
          end;
       end In_Current_Evaluation;
 
-      -------------------------------
-      -- Update_Current_Evaluation --
-      -------------------------------
+   --  Start of processing for Condition_Evaluated
 
-      procedure Update_Current_Evaluation (ES_Top : in out Evaluation) is
+   begin
+      --  No-op unless doing MC/DC analysis
+
+      if not MCDC_Coverage_Enabled then
+         return;
+      end if;
+
+      --  No-op if decision has no multi-path condition and not debugging
+
+      if not (Has_Multipath_Condition (D_SCO) or else Debug_Full_History) then
+         return;
+      end if;
+
+      if not In_Current_Evaluation then
+         Evaluation_Stack.Append
+           (Evaluation'(Decision       => D_SCO,
+                        Next_Condition => 0,
+                        Outcome        => Unknown,
+                        others         => <>));
+      end if;
+
+      if not In_Current_Evaluation then
+         Report
+           (Exe, PC,
+            "unexpected condition" & Index (C_SCO)'Img & " in trace, expected"
+            & Evaluation_Stack.Last_Element.Next_Condition'Img,
+            Kind => Warning);
+      end if;
+
+      --  Record the value of condition C_SCO in the current evaluation, and
+      --  set the next expected condition.
+
+      declare
+         ES_Top     : Evaluation renames
+            Evaluation_Stack.Reference (Evaluation_Stack.Last_Index);
          Next_C_SCO : SCO_Id;
       begin
          --  Add Unknown markers for masked conditions
@@ -1258,41 +1430,7 @@ package body Coverage.Source is
          else
             ES_Top.Next_Condition := No_Condition_Index;
          end if;
-      end Update_Current_Evaluation;
-
-   --  Start of processing for Condition_Evaluated
-
-   begin
-      --  No-op unless doing MC/DC analysis
-
-      if not MCDC_Coverage_Enabled then
-         return;
-      end if;
-
-      --  No-op if decision has no diamond and not debugging
-
-      if not (Has_Diamond (D_SCO) or else Debug_Full_History) then
-         return;
-      end if;
-
-      if not In_Current_Evaluation then
-         Evaluation_Stack.Append
-           (Evaluation'(Decision       => D_SCO,
-                        Next_Condition => 0,
-                        Outcome        => Unknown,
-                        others         => <>));
-      end if;
-
-      if not In_Current_Evaluation then
-         Report
-           (Exe, PC,
-            "unexpected condition" & Index (C_SCO)'Img & " in trace, expected"
-            & Evaluation_Stack.Last_Element.Next_Condition'Img,
-            Kind => Warning);
-      end if;
-
-      Evaluation_Stack.Update_Element
-        (Evaluation_Stack.Last_Index, Update_Current_Evaluation'Access);
+      end;
    end Condition_Evaluated;
 
    --------------------------------
@@ -1334,42 +1472,30 @@ package body Coverage.Source is
      (SCO : SCO_Id; Tag : SC_Tag) return Source_Coverage_Info_Access
    is
       Result : RW_Source_Coverage_Info_Access;
-
-      procedure Q (SCI : RW_Source_Coverage_Info_Access);
-      --  Set Result to SCI if SCI.Tag = Tag
-
-      procedure QV (SCIV : SCI_Vectors.Vector);
-      --  Run Q for each element of SCIV, stopping if Result is set
-
-      -------
-      -- Q --
-      -------
-
-      procedure Q (SCI : RW_Source_Coverage_Info_Access) is
-      begin
-         if SCI.Tag = Tag then
-            Result := SCI;
-         end if;
-      end Q;
-
-      --------
-      -- QV --
-      --------
-
-      procedure QV (SCIV : SCI_Vectors.Vector) is
-      begin
-         for J in SCIV.First_Index .. SCIV.Last_Index loop
-            SCIV.Query_Element (J, Q'Access);
-            exit when Result /= null;
-         end loop;
-      end QV;
-
-   --  Start of processing for Get_SCI
-
    begin
+      --  Look for a SCI that matches both SCO and Tag and assign it to Result
+
       if SCO in SCI_Vector.First_Index .. SCI_Vector.Last_Index then
-         SCI_Vector.Query_Element (SCO, QV'Access);
+
+         declare
+            SCIV : SCI_Vectors.Vector renames SCI_Vector.Reference (SCO);
+         begin
+            for J in SCIV.First_Index .. SCIV.Last_Index loop
+               declare
+                  SCI : constant RW_Source_Coverage_Info_Access :=
+                     SCIV.Element (J);
+               begin
+                  if SCI.Tag = Tag then
+                     Result := SCI;
+                     exit;
+                  end if;
+               end;
+            end loop;
+         end;
       end if;
+
+      --  If we found one, return its source coverage info, otherwise return
+      --  the default SCI for this kind of SCO.
 
       return
         (if Result /= null
@@ -1570,56 +1696,32 @@ package body Coverage.Source is
       Tag     : SC_Tag;
       Process : access procedure (SCI : in out Source_Coverage_Info))
    is
-      procedure Deref_Process (SCIA : RW_Source_Coverage_Info_Access);
-      --  Call Process (SCIA.all) and set Processed to True if SCIA.Tag = Tag
+      SCIV : SCI_Vectors.Vector renames SCI_Vector.Reference (SCO);
+   begin
+      --  Look for a SCI whose tag matches Tag. If we find one, call Process
+      --  on it and return.
 
-      procedure Update_SCIV (SCIV : in out SCI_Vectors.Vector);
-      --  Call Process on the relevant element of SCIV
-
-      Processed : Boolean;
-
-      -------------------
-      -- Deref_Process --
-      -------------------
-
-      procedure Deref_Process (SCIA : RW_Source_Coverage_Info_Access) is
-      begin
-         if SCIA.Tag = Tag then
-            Process (SCIA.all);
-            Processed := True;
-         end if;
-      end Deref_Process;
-
-      -----------------
-      -- Update_SCIV --
-      -----------------
-
-      procedure Update_SCIV (SCIV : in out SCI_Vectors.Vector) is
-      begin
-         Processed := False;
-         for J in SCIV.First_Index .. SCIV.Last_Index loop
-            SCIV.Query_Element (J, Deref_Process'Access);
-            if Processed then
+      for J in SCIV.First_Index .. SCIV.Last_Index loop
+         declare
+            SCI : Source_Coverage_Info renames SCIV.Element (J).all;
+         begin
+            if SCI.Tag = Tag then
+               Process (SCI);
                return;
             end if;
-         end loop;
-
-         --  Here if no SCI exists yet for this SCO and tag
-
-         declare
-            New_SCI : constant RW_Source_Coverage_Info_Access :=
-                        new Source_Coverage_Info (Kind (SCO));
-         begin
-            New_SCI.Tag := Tag;
-            Process (New_SCI.all);
-            SCIV.Append (New_SCI);
          end;
-      end Update_SCIV;
+      end loop;
 
-   --  Start of processing for Update_SCI
+      --  Otherwise, create a new SCI for this tag and call Process on it
 
-   begin
-      SCI_Vector.Update_Element (SCO, Update_SCIV'Access);
+      declare
+         New_SCI : constant RW_Source_Coverage_Info_Access :=
+                     new Source_Coverage_Info (Kind (SCO));
+      begin
+         New_SCI.Tag := Tag;
+         Process (New_SCI.all);
+         SCIV.Append (New_SCI);
+      end;
    end Update_SCI;
 
    ------------------

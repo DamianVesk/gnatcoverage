@@ -2,7 +2,7 @@
 --                                                                          --
 --                               GNATcoverage                               --
 --                                                                          --
---                     Copyright (C) 2009-2012, AdaCore                     --
+--                     Copyright (C) 2009-2019, AdaCore                     --
 --                                                                          --
 -- GNATcoverage is free software; you can redistribute it and/or modify it  --
 -- under terms of the GNU General Public License as published by the  Free  --
@@ -21,7 +21,6 @@ with Ada.Strings.Unbounded;
 with Ada.Text_IO;             use Ada.Text_IO;
 
 with GNAT.Regpat; use GNAT.Regpat;
-with Namet;
 with SCOs;
 
 with Diagnostics; use Diagnostics;
@@ -59,9 +58,6 @@ package body ALI_Files is
       Deps                 : SFI_Vector);
    --  Mark SCOs.SCO_Unit_Table entries to be ignored by setting their Dep_Num
    --  to Missing_Dep_Num.
-
-   function SCO_Tables_Fingerprint return SCOs_Hash;
-   --  Return a fingerprint for all SCO tables in SCOs
 
    -------------
    -- Unquote --
@@ -126,83 +122,6 @@ package body ALI_Files is
       end loop;
    end Mark_Ignored_Units;
 
-   ----------------------------
-   -- SCO_Tables_Fingerprint --
-   ----------------------------
-
-   function SCO_Tables_Fingerprint return SCOs_Hash is
-      use GNAT.SHA1;
-      use Namet;
-      use SCOs;
-
-      procedure Update (S : String);
-      --  Shortcut for Update (Hash_Ctx, S)
-
-      procedure Update (Sloc : SCOs.Source_Location);
-      --  Update Hash_Ctx with Sloc
-
-      Hash_Ctx  : GNAT.SHA1.Context;
-
-      ------------
-      -- Update --
-      ------------
-
-      procedure Update (S : String) is
-      begin
-         Update (Hash_Ctx, S);
-      end Update;
-
-      ------------
-      -- Update --
-      ------------
-
-      procedure Update (Sloc : SCOs.Source_Location) is
-      begin
-         Update (Hash_Ctx, ":" & Logical_Line_Number'Image (Sloc.Line)
-                           & ":" & Column_Number'Image (Sloc.Col));
-      end Update;
-
-   begin
-      --  The aim is to include in the hash all information for which
-      --  inconsistency during consolidation would make coverage analysis
-      --  nonsensical.
-
-      for I in SCO_Unit_Table.First + 1 .. SCO_Unit_Table.Last loop
-         declare
-            U : SCO_Unit_Table_Entry renames SCO_Unit_Table.Table (I);
-         begin
-            if U.Dep_Num /= Missing_Dep_Num then
-               --
-               --  Directly streaming U to the hash stream would make the
-               --  fingerprint computation depend on compiler internals (here,
-               --  pragma representation values). Instead, use human-readable
-               --  and compiler-independant values.
-
-               Update (U.File_Name.all);
-               Update (Nat'Image (U.Dep_Num));
-
-               for S in U.From .. U.To loop
-                  declare
-                     E : SCO_Table_Entry renames SCO_Table.Table (S);
-                  begin
-                     Update (E.From);
-                     Update (E.To);
-                     Update (String'((E.C1, E.C2)));
-                     if E.Last then
-                        Update ("Last");
-                     end if;
-                     if E.Pragma_Aspect_Name /= No_Name then
-                        Update (Get_Name_String (E.Pragma_Aspect_Name));
-                     end if;
-                  end;
-               end loop;
-            end if;
-         end;
-      end loop;
-
-      return SCOs_Hash (Binary_Message_Digest'(Digest (Hash_Ctx)));
-   end SCO_Tables_Fingerprint;
-
    --------------
    -- Load_ALI --
    --------------
@@ -210,12 +129,10 @@ package body ALI_Files is
    procedure Load_ALI (ALI_Filename : String) is
       Discard_ALI  : Source_File_Index;
       Discard_Units, Discard_Deps : SFI_Vector;
-      Discard_Fingerprint : SCOs_Hash;
 
       pragma Unreferenced (Discard_ALI);
       pragma Warnings (Off, Discard_Units);
       pragma Warnings (Off, Discard_Deps);
-      pragma Warnings (Off, Discard_Fingerprint);
 
    begin
       Discard_ALI :=
@@ -224,7 +141,6 @@ package body ALI_Files is
                   Ignored_Source_Files => null,
                   Units                => Discard_Units,
                   Deps                 => Discard_Deps,
-                  Fingerprint          => Discard_Fingerprint,
                   With_SCOs            => False);
    end Load_ALI;
 
@@ -238,7 +154,6 @@ package body ALI_Files is
       Ignored_Source_Files : access GNAT.Regexp.Regexp;
       Units                : out SFI_Vector;
       Deps                 : out SFI_Vector;
-      Fingerprint          : out SCOs_Hash;
       With_SCOs            : Boolean) return Source_File_Index
    is
       ALI_File  : File_Type;
@@ -391,6 +306,9 @@ package body ALI_Files is
       Debug_Seen                 : Boolean := False;
       --  Set True if unit has been compiled with -g
 
+      Profile_Arcs_Seen          : Boolean := False;
+      --  Set True if unit has been compiled with -fprofile-arcs
+
       Expected_Annotation_Kind : ALI_Annotation_Kind;
       Expected_Annotation_Msg  : String_Access;
       --  Variables for checking of annotation validity: annotations must
@@ -477,6 +395,9 @@ package body ALI_Files is
 
                elsif Line.all = "A -g" then
                   Debug_Seen := True;
+
+               elsif Line.all = "A -fprofile-arcs" then
+                  Profile_Arcs_Seen := True;
                end if;
 
             when 'P' =>
@@ -561,11 +482,15 @@ package body ALI_Files is
 
                      Valid := True;
 
+                     declare
+                        Msg : constant String := Match (6);
                      begin
                         Annotation :=
                           (CU      => CU,
                            Kind    => ALI_Annotation_Kind'Value (Match (4)),
-                           Message => new String'(Match (6)),
+                           Message => (if Msg'Length > 0
+                                       then new String'(Msg)
+                                       else null),
                            others  => <>);
                      exception
                         when Constraint_Error =>
@@ -592,7 +517,7 @@ package body ALI_Files is
                         end if;
 
                         if Annotation.Kind = Exempt_On then
-                           if Annotation.Message.all = "" then
+                           if Annotation.Message = null then
                               Report (Sloc, "empty message for EXEMPT_ON");
                            end if;
 
@@ -654,6 +579,12 @@ package body ALI_Files is
                  ("warning: " & ALI_Filename
                   & ": unit compiled without debug information (-g)");
             end if;
+
+            if Profile_Arcs_Seen then
+               Put_Line
+                 ("warning: " & ALI_Filename
+                  & ": unit compiled with instrumentation (-fprofile-arcs)");
+            end if;
          end if;
 
          if not End_Of_File (ALI_File)
@@ -670,7 +601,6 @@ package body ALI_Files is
 
             SCOs.Initialize;
          end if;
-         Fingerprint := SCO_Tables_Fingerprint;
       end if;
 
       Close (ALI_File);
@@ -688,7 +618,14 @@ package body ALI_Files is
    begin
       CU_Id'Read (S, V.CU);
       ALI_Annotation_Kind'Read (S, V.Kind);
-      V.Message := new String'(String'Input (S));
+
+      declare
+         Msg : constant String := String'Input (S);
+      begin
+         if Msg'Length > 0 then
+            V.Message := new String'(Msg);
+         end if;
+      end;
       V.Count := 0;
    end Read;
 
@@ -700,7 +637,11 @@ package body ALI_Files is
    begin
       CU_Id'Write (S, V.CU);
       ALI_Annotation_Kind'Write (S, V.Kind);
-      String'Output (S, V.Message.all);
+      if V.Message /= null then
+         String'Output (S, V.Message.all);
+      else
+         String'Output (S, "");
+      end if;
    end Write;
 
 end ALI_Files;
